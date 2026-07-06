@@ -1,3 +1,6 @@
+process.on('uncaughtException', e => console.error('[CRASH]', e));
+process.on('unhandledRejection', e => console.error('[CRASH]', e));
+
 const fs = require('fs');
 const path = require('path');
 const { PassThrough } = require('stream');
