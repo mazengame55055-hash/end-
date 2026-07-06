@@ -329,7 +329,7 @@ client.on('messageCreate', async (message) => {
         }
 
         if (message.content === '!help') {
-            const reply = [
+            const helpTxt = [
                 '🤖 **الأوامر:**',
                 '',
                 '`!tv` - عرض قائمة القنوات',
@@ -340,7 +340,7 @@ client.on('messageCreate', async (message) => {
                 '`!txt` - تصدير القنوات إلى ملف',
                 '`!help` - المساعدة',
             ].join('\n');
-            await reply(message, reply);
+            await reply(message, helpTxt);
         }
 
         if (message.content === '!status') {
