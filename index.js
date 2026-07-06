@@ -277,6 +277,8 @@ client.on('messageCreate', async (message) => {
                 });
 
                 const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 16 });
+                bufferStream.on('error', () => {});
+                ffmpegProcess.stdout.on('error', () => {});
                 ffmpegProcess.stdout.pipe(bufferStream);
                 await playStream(bufferStream, streamer, {
                     type: 'go-live',
@@ -350,8 +352,8 @@ client.on('messageCreate', async (message) => {
             ffmpegProcess.kill('SIGKILL');
             ffmpegProcess = null;
         }
-        streamer.stopStream();
-        streamer.leaveVoice();
+        try { streamer.stopStream(); } catch (_) {}
+        try { streamer.leaveVoice(); } catch (_) {}
     }
 });
 
