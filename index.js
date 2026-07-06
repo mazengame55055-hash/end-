@@ -122,7 +122,7 @@ async function showChannelsPage(message, channels, page) {
     const list = pageEntries.map(([key, ch]) =>
         `\`${String(key).padStart(3)}\` ${ch.name}`
     ).join('\n');
-    const reply = [
+    const channelList = [
         `📺 **قنوات IPTV** — الصفحة ${validPage}/${totalPages} (${total} قناة)`,
         '',
         list,
@@ -132,7 +132,7 @@ async function showChannelsPage(message, channels, page) {
         '🔹 `!play <رقم>` للتشغيل',
         '🔹 `!stop` للإيقاف',
     ].filter(Boolean).join('\n');
-    await reply(message, reply);
+    await reply(message, channelList);
 }
 
 async function stopPlaying(message) {
