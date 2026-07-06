@@ -1,10 +1,11 @@
 import os, subprocess, time, signal, sys
 
 os.chdir('/content/end-')
-TOKEN = os.environ.get('TOKEN') or sys.argv[1] if len(sys.argv) > 1 else None
+TOKEN = os.environ.get('TOKEN') or (sys.argv[1] if len(sys.argv) > 1 else None)
 
 if not TOKEN:
-    print('ERROR: Set TOKEN env var or pass as argument')
+    print('Usage: TOKEN="your_token" python3 colab_run.py')
+    print('   or: python3 colab_run.py "your_token"')
     sys.exit(1)
 
 env = {**os.environ, 'TOKEN': TOKEN}

@@ -25,7 +25,19 @@ const { Streamer, playStream } = require('@dank074/discord-video-stream');
 const { Readable } = require('stream');
 const { spawn } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
-const ffmpegPath = ffmpegStatic;
+const { execSync } = require('child_process');
+let ffmpegPath = ffmpegStatic;
+if (process.platform === 'linux') {
+    try {
+        const sysFfmpeg = execSync('which ffmpeg', { encoding: 'utf8' }).trim();
+        if (sysFfmpeg) {
+            ffmpegPath = sysFfmpeg;
+            console.log('Using system ffmpeg:', ffmpegPath);
+        }
+    } catch (_) {
+        console.log('No system ffmpeg, using ffmpeg-static');
+    }
+}
 
 const client = new Client();
 const streamer = new Streamer(client);
