@@ -126,13 +126,13 @@ async function showChannelsPage(message, channels, page) {
 async function stopPlaying(message) {
     const name = currentChannelName || '';
     if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGKILL');
+        try { ffmpegProcess.kill('SIGKILL'); } catch (_) {}
         ffmpegProcess = null;
     }
-    streamer.stopStream();
-    streamer.leaveVoice();
+    try { streamer.stopStream(); } catch (_) {}
+    try { streamer.leaveVoice(); } catch (_) {}
     if (abortController) {
-        abortController.abort();
+        try { abortController.abort(); } catch (_) {}
         abortController = null;
     }
     currentChannelName = null;
