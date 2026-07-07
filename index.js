@@ -233,27 +233,24 @@ client.on('messageCreate', async (message) => {
                 }
 
                 const { width, height, fps, bitrate, maxrate, bufsize } = selectedQuality;
-                const isLowRes = width <= 640;
                 ffmpegProcess = spawn(ffmpegPath, [
                     '-headers', 'User-Agent: VLC/3.0.20 LibVLC/3.0.20\r\n',
                     '-timeout', '30000000',
-                    '-re',
                     '-reconnect', '1',
                     '-reconnect_streamed', '1',
                     '-reconnect_delay_max', '10',
                     '-reconnect_at_eof', '1',
                     '-reconnect_on_network_error', '1',
-                    '-analyzeduration', isLowRes ? '500000' : '1000000',
-                    '-probesize', isLowRes ? '500000' : '1000000',
-                    '-thread_queue_size', '2048',
+                    '-analyzeduration', '500000',
+                    '-probesize', '500000',
+                    '-thread_queue_size', '4096',
                     '-i', channel.url,
                     '-fflags', '+nobuffer+discardcorrupt',
                     '-flags', '+low_delay',
                     '-c:v', 'libx264',
-                    '-preset', isLowRes ? 'ultrafast' : 'superfast',
+                    '-preset', 'ultrafast',
                     '-tune', 'zerolatency',
-                    '-profile:v', 'main',
-                    '-crf', '23',
+                    '-profile:v', 'baseline',
                     '-ar', '48000',
                     '-c:a', 'libopus',
                     '-b:a', '96k',
@@ -263,6 +260,7 @@ client.on('messageCreate', async (message) => {
                     '-bufsize', bufsize,
                     '-pix_fmt', 'yuv420p',
                     '-row-mt', '1',
+                    '-threads', '4',
                     '-f', 'mpegts',
                     'pipe:1',
                 ], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -294,7 +292,7 @@ client.on('messageCreate', async (message) => {
                     }
                 });
 
-                const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 16 });
+                const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 32 });
                 bufferStream.on('error', () => {});
                 ffmpegProcess.stdout.on('error', () => {});
                 ffmpegProcess.stdout.pipe(bufferStream);
@@ -341,7 +339,7 @@ client.on('messageCreate', async (message) => {
                 '`!tv` - عرض قائمة القنوات',
                 '`!play <رقم>` - تشغيل قناة',
                 '`!stop` - إيقاف البث',
-                '`!quality <lowend|low|medium|high>` - ضبط الجودة',
+                '`!quality <240p|360p|480p|720p|720pf|1080p>` - ضبط الجودة',
                 '`!status` - حالة البث',
                 '`!txt` - تصدير القنوات إلى ملف',
                 '`!help` - المساعدة',
