@@ -61,13 +61,15 @@ const IPTV = {
 const M3U_URL = `${IPTV.host}:${IPTV.port}/get.php?username=${IPTV.user}&password=${IPTV.pass}&type=m3u_plus&output=ts`;
 
 const QUALITY_PRESETS = {
-    lowend: { width: 640, height: 360, fps: 20, bitrate: '500k', maxrate: '500k', bufsize: '1000k' },
-    low: { width: 854, height: 480, fps: 24, bitrate: '800k', maxrate: '800k', bufsize: '1600k' },
-    medium: { width: 960, height: 540, fps: 25, bitrate: '2000k', maxrate: '2000k', bufsize: '4000k' },
-    high: { width: 1280, height: 720, fps: 30, bitrate: '2500k', maxrate: '2500k', bufsize: '5000k' },
+    '240p': { width: 426, height: 240, fps: 15, bitrate: '300k', maxrate: '300k', bufsize: '600k' },
+    '360p': { width: 640, height: 360, fps: 20, bitrate: '600k', maxrate: '600k', bufsize: '1200k' },
+    '480p': { width: 854, height: 480, fps: 24, bitrate: '1200k', maxrate: '1200k', bufsize: '2400k' },
+    '720p': { width: 1280, height: 720, fps: 30, bitrate: '4000k', maxrate: '4000k', bufsize: '8000k' },
+    '720pf': { width: 1280, height: 720, fps: 25, bitrate: '3000k', maxrate: '3000k', bufsize: '6000k' },
+    '1080p': { width: 1920, height: 1080, fps: 30, bitrate: '6000k', maxrate: '6000k', bufsize: '12000k' },
 };
 
-let selectedQuality = QUALITY_PRESETS.medium;
+let selectedQuality = QUALITY_PRESETS['720p'];
 let currentChannelName = null;
 let abortController = null;
 let channelsCache = null;
@@ -183,7 +185,7 @@ client.on('messageCreate', async (message) => {
         if (message.content.startsWith('!quality ')) {
             const preset = message.content.split(' ')[1];
             if (!QUALITY_PRESETS[preset]) {
-                return reply(message, '❌ الخيارات: lowend, low, medium, high');
+                return reply(message, '❌ الخيارات: 240p, 360p, 480p, 720p, 720pf, 1080p');
             }
             selectedQuality = QUALITY_PRESETS[preset];
             await reply(message, `✅ تم ضبط الجودة إلى **${preset}** (${selectedQuality.width}x${selectedQuality.height}, ${selectedQuality.fps}fps)`);
@@ -231,6 +233,7 @@ client.on('messageCreate', async (message) => {
                 }
 
                 const { width, height, fps, bitrate, maxrate, bufsize } = selectedQuality;
+                const isLowRes = width <= 640;
                 ffmpegProcess = spawn(ffmpegPath, [
                     '-headers', 'User-Agent: VLC/3.0.20 LibVLC/3.0.20\r\n',
                     '-timeout', '30000000',
@@ -240,15 +243,17 @@ client.on('messageCreate', async (message) => {
                     '-reconnect_delay_max', '10',
                     '-reconnect_at_eof', '1',
                     '-reconnect_on_network_error', '1',
-                    '-analyzeduration', '2000000',
-                    '-probesize', '2000000',
-                    '-thread_queue_size', '512',
+                    '-analyzeduration', isLowRes ? '500000' : '1000000',
+                    '-probesize', isLowRes ? '500000' : '1000000',
+                    '-thread_queue_size', '2048',
                     '-i', channel.url,
                     '-fflags', '+nobuffer+discardcorrupt',
                     '-flags', '+low_delay',
                     '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
+                    '-preset', isLowRes ? 'ultrafast' : 'superfast',
                     '-tune', 'zerolatency',
+                    '-profile:v', 'main',
+                    '-crf', '23',
                     '-ar', '48000',
                     '-c:a', 'libopus',
                     '-b:a', '96k',
@@ -257,6 +262,7 @@ client.on('messageCreate', async (message) => {
                     '-maxrate', maxrate,
                     '-bufsize', bufsize,
                     '-pix_fmt', 'yuv420p',
+                    '-row-mt', '1',
                     '-f', 'mpegts',
                     'pipe:1',
                 ], { stdio: ['pipe', 'pipe', 'pipe'] });
