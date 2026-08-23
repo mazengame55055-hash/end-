@@ -96,9 +96,10 @@ let mediaInfo = null;
 let pendingSeek = null;
 let seekOffset = 0;
 let activePlayPromise = null;
+let seekFails = 0;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
-const RECONNECT_DELAY = 3000;
+const RECONNECT_DELAY = 8000;
 
 function parseM3U(m3uText) {
     const channels = {};
@@ -537,6 +538,7 @@ async function startYtStream(urls, quality, message, title, refresher) {
     reconnectAttempts = 0;
     seekOffset = 0;
     pendingSeek = null;
+    seekFails = 0;
     isPaused = false;
     mediaInfo = { title: title || currentChannelName || 'media', live: false, offsetBase: 0, runStartedAt: Date.now(), paused: false, pauseStartedAt: null };
     const { width, height, fps, bitrate, maxrate, bufsize } = quality;
@@ -614,8 +616,11 @@ async function startYtStream(urls, quality, message, title, refresher) {
                 ffmpegProcess.on('exit', (code, signal) => {
                     ffmpegProcess = null;
                     if (code !== 0 && code !== null && signal !== 'SIGKILL') {
+                        const last = stderrLog.split('\n').slice(-4).join('\n');
+                        console.error(`[FFmpeg] Exit code=${code}:\n${last}`);
                         reject(new Error(`FFmpeg exited code=${code}`));
                     } else {
+                        console.log(`[FFmpeg] Exit code=${code} signal=${signal}`);
                         resolve();
                     }
                 });
@@ -657,6 +662,22 @@ async function startYtStream(urls, quality, message, title, refresher) {
             await sleep(500);
             continue;
         }
+
+        const ranMs = Date.now() - (mediaInfo ? mediaInfo.runStartedAt : Date.now());
+        if (seekOffset > 0 && ranMs < 8000 && seekFails < 3) {
+            seekFails++;
+            console.log(`[YT] Seeked run died fast (${Math.round(ranMs / 1000)}s), retry ${seekFails}/3 with fresh URL`);
+            if (refresher) {
+                try {
+                    const nu = await refresher();
+                    if (nu && nu[0]) { urlList[0] = nu[0]; videoUrl = urlList[0]; audioUrl = nu[1] || null; }
+                } catch (_) {}
+            }
+            reconnectAttempts = 0;
+            await sleep(10000);
+            continue;
+        }
+        if (ranMs >= 30000) seekFails = 0;
 
         if (refresher && reconnectAttempts > 0) {
             try {
