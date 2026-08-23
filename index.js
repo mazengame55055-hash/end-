@@ -502,7 +502,7 @@ async function vkSources(type, tmdbId, season, episode) {
                     found.push({ url: q.url, quality: q.quality || 'auto', server: srv.name });
                 }
             }
-            if (found.length >= 2) break;
+            if (found.length >= 2 && new Set(found.map((f) => f.server)).size >= 2) break;
         } catch (_) { /* try next server */ }
     }
     return { title, year, sources: found };
@@ -579,6 +579,7 @@ async function startYtStream(urls, quality, message, title, refresher) {
             await new Promise((resolve, reject) => {
                 const mkInput = (u) => [
                     ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
+                    ...(/\.m3u8(\?|$)/i.test(u) ? ['-re', '-readrate', '1.15'] : []),
                     '-reconnect', '1',
                     '-reconnect_streamed', '1',
                     '-reconnect_delay_max', '5',
@@ -944,10 +945,14 @@ client.on('messageCreate', async (message) => {
                 currentChannelName = res.title;
                 await reply(message, `🎬 جاري بث **${res.title}** في الروم...`);
                 console.log(`[VK] movie ${id} via ${best.server} ${best.quality}`);
+                let srcIdx = 1;
                 const refresh = async () => {
                     const r2 = await vkSources('movie', id, 1, 1);
-                    const b2 = vkPickBest(r2.sources);
-                    return b2 ? [b2.url] : null;
+                    if (!r2.sources.length) return null;
+                    const pick = r2.sources[srcIdx % r2.sources.length];
+                    srcIdx++;
+                    console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
+                    return [pick.url];
                 };
                 const st = await startYtStream([best.url], selectedQuality, message, res.title, refresh);
                 isPlaying = false;
@@ -974,10 +979,14 @@ client.on('messageCreate', async (message) => {
                 currentChannelName = res.title;
                 await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...`);
                 console.log(`[VK] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}`);
+                let srcIdxTv = 1;
                 const refreshTv = async () => {
                     const r2 = await vkSources('tv', parts[0], s, e);
-                    const b2 = vkPickBest(r2.sources);
-                    return b2 ? [b2.url] : null;
+                    if (!r2.sources.length) return null;
+                    const pick = r2.sources[srcIdxTv % r2.sources.length];
+                    srcIdxTv++;
+                    console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
+                    return [pick.url];
                 };
                 const st2 = await startYtStream([best.url], selectedQuality, message, res.title, refreshTv);
                 isPlaying = false;
