@@ -95,6 +95,7 @@ let isPaused = false;
 let mediaInfo = null;
 let pendingSeek = null;
 let seekOffset = 0;
+let activePlayPromise = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
 const RECONNECT_DELAY = 3000;
@@ -176,6 +177,7 @@ async function stopPlaying(message) {
     reconnectAttempts = MAX_RECONNECT;
     killFFmpeg();
     try { streamer.stopStream(); } catch (_) {}
+    activePlayPromise = null;
     try { streamer.leaveVoice(); } catch (_) {}
     if (abortController) {
         try { abortController.abort(); } catch (_) {}
@@ -274,6 +276,10 @@ async function startStream(channel, message) {
                 await sleep(700);
             }
             try { streamer.stopStream(); } catch (_) {}
+            if (activePlayPromise) {
+                await Promise.race([activePlayPromise.catch(() => {}), sleep(4000)]);
+                activePlayPromise = null;
+            }
             await sleep(300);
         } catch (e) {
             console.error('[Stream] Failed to join voice:', e.message);
@@ -323,13 +329,13 @@ async function startStream(channel, message) {
                     resolve();
                 });
 
-                const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 16 });
+                const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 2 });
                 bufferStream.on('error', () => {});
                 ffmpegProcess.stdout.pipe(bufferStream);
                 mediaBufferStream = bufferStream;
                 if (mediaInfo) { mediaInfo.runStartedAt = Date.now(); }
 
-                playStream(bufferStream, streamer, {
+                activePlayPromise = playStream(bufferStream, streamer, {
                     type: 'go-live',
                     format: 'mpegts',
                     width: selectedQuality.width,
@@ -543,6 +549,10 @@ async function startYtStream(urls, quality, message, title, refresher) {
             try {
                 await joinVoiceSafe();
                 try { streamer.stopStream(); } catch (_) {}
+                if (activePlayPromise) {
+                    await Promise.race([activePlayPromise.catch(() => {}), sleep(4000)]);
+                    activePlayPromise = null;
+                }
                 await sleep(300);
             } catch (e) {
                 isPlaying = false;
@@ -613,13 +623,13 @@ async function startYtStream(urls, quality, message, title, refresher) {
                 abortController = new AbortController();
                 abortController.signal.addEventListener('abort', () => { killFFmpeg(); resolve(); });
 
-                const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 16 });
+                const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 2 });
                 bufferStream.on('error', () => {});
                 ffmpegProcess.stdout.pipe(bufferStream);
                 mediaBufferStream = bufferStream;
                 if (mediaInfo) { mediaInfo.offsetBase = seekOffset; mediaInfo.runStartedAt = Date.now(); }
 
-                playStream(bufferStream, streamer, {
+                activePlayPromise = playStream(bufferStream, streamer, {
                     type: 'go-live',
                     format: 'mpegts',
                     width: selectedQuality.width,
@@ -640,7 +650,11 @@ async function startYtStream(urls, quality, message, title, refresher) {
             reconnectAttempts = 0;
             console.log(`[YT] Seek -> ${seekOffset}s`);
             try { streamer.stopStream(); } catch (_) {}
-            await sleep(400);
+            if (activePlayPromise) {
+                await Promise.race([activePlayPromise.catch(() => {}), sleep(4000)]);
+                activePlayPromise = null;
+            }
+            await sleep(500);
             continue;
         }
 
