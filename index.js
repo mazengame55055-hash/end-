@@ -110,7 +110,7 @@ setInterval(() => {
 }, 5000);
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
-const RECONNECT_DELAY = 8000;
+const RECONNECT_DELAY = 4000;
 
 function parseM3U(m3uText) {
     const channels = {};
@@ -536,6 +536,25 @@ function vlInit() {
     return vlReadyPromise;
 }
 
+let vlUndici = null;
+function vlGetUndici() {
+    if (vlUndici === null) {
+        try { vlUndici = require('undici'); } catch (_) { vlUndici = false; }
+    }
+    return vlUndici || null;
+}
+
+async function vlApiFetch(url, headers) {
+    const U = vlGetUndici();
+    if (U && U.fetch && U.Agent) {
+        const agent = new U.Agent({ keepAliveTimeout: 10, keepAliveMaxTimeout: 100 });
+        try {
+            return await U.fetch(url, { headers, dispatcher: agent, signal: AbortSignal.timeout(20000) });
+        } finally { try { await agent.close(); } catch (_) {} }
+    }
+    return fetch(url, { headers, signal: AbortSignal.timeout(20000) });
+}
+
 async function vlSources(type, tmdbId, season, episode) {
     await vlInit();
     globalThis.sodium = vlSodium;
@@ -544,10 +563,7 @@ async function vlSources(type, tmdbId, season, episode) {
     const apiUrl = type === 'movie'
         ? `${VL_BASE}/api/b/movie/${adv}?multiLang=0`
         : `${VL_BASE}/api/b/tv/${adv}/${season || 1}/${episode || 1}?multiLang=0`;
-    const r = await fetch(apiUrl, {
-        headers: { 'X-Playback-Environment': 'default', Referer: `${VL_BASE}/` },
-        signal: AbortSignal.timeout(20000),
-    });
+    const r = await vlApiFetch(apiUrl, { 'X-Playback-Environment': 'default', Referer: `${VL_BASE}/` });
     if (!r.ok) { console.log(`[VL] api http ${r.status} for ${type} ${tmdbId}`); return null; }
     const txt = await r.text();
     if (!txt || txt === 'null') { console.log(`[VL] api empty for ${type} ${tmdbId}`); return null; }
@@ -608,6 +624,30 @@ async function vlFetchArabicSub(subUrl) {
 
 function vlCleanupSub(p) {
     if (p) { try { fs.unlinkSync(p); } catch (_) {} }
+}
+
+function makeCrossRefresh(type, id, s, e, state) {
+    return async () => {
+        if (state.provider === 'VL') {
+            try {
+                const r2 = await vlSources(type, id, s, e);
+                if (r2 && r2.sources.length) {
+                    const pick = r2.sources[state.idx % r2.sources.length];
+                    state.idx++;
+                    console.log(`[VL] refresh -> ${pick.quality}`);
+                    return [pick];
+                }
+            } catch (_) {}
+            console.log('[VL] refresh exhausted -> switching to VK');
+            state.provider = 'VK';
+        }
+        const r3 = await vkSources(type, id, s, e);
+        if (!r3 || !r3.sources.length) return null;
+        const pick = r3.sources[state.idx % r3.sources.length];
+        state.idx++;
+        console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
+        return [pick.url];
+    };
 }
 
 
@@ -680,7 +720,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 const mkInput = (u, hdrs) => [
                     ...(hdrs && hdrs.referer ? ['-headers', Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n'] : []),
                     ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
-                    ...(/\.m3u8(\?|$)/i.test(u) ? ['-re', '-readrate', '1.15'] : []),
+                    ...(/^https?:\/\//i.test(u) ? ['-re', '-readrate', '1.05'] : []),
                     '-reconnect', '1',
                     '-reconnect_streamed', '1',
                     '-reconnect_delay_max', '5',
@@ -808,10 +848,18 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     videoUrl = curSrc.url;
                     audioUrl = nu[1] ? asSrc(nu[1]).url : null;
                     console.log('[YT] Refreshed source URL');
-                    seekOffset = 0;
                 }
             } catch (e) {
                 console.error('[YT] refresh failed:', e.message);
+            }
+        }
+
+        if (!pendingSeek && mediaInfo && !mediaInfo.live) {
+            const endT = mediaInfo.paused && mediaInfo.pauseStartedAt ? mediaInfo.pauseStartedAt : Date.now();
+            const pos = (mediaInfo.offsetBase || 0) + Math.max(0, (endT - (mediaInfo.runStartedAt || endT)) / 1000);
+            if (pos > 5) {
+                console.log(`[YT] auto-resume from ${Math.floor(pos)}s`);
+                seekOffset = Math.floor(pos);
             }
         }
 
@@ -1060,23 +1108,8 @@ client.on('messageCreate', async (message) => {
                 currentChannelName = res.title;
                 await reply(message, `🎬 جاري بث **${res.title}** في الروم...${subPath ? ' 📝 بالترجمة العربية' : ''}`);
                 console.log(`[${provider}] movie ${id} via ${best.server} ${best.quality}${subPath ? ' +subs' : ''}`);
-                let srcIdx = 1;
-                const refresh = async () => {
-                    if (provider === 'VL') {
-                        const r2 = await vlSources('movie', id);
-                        if (!r2 || !r2.sources.length) return null;
-                        const pick = r2.sources[srcIdx % r2.sources.length];
-                        srcIdx++;
-                        console.log(`[VL] refresh -> ${pick.server} ${pick.quality}`);
-                        return [pick];
-                    }
-                    const r2 = await vkSources('movie', id, 1, 1);
-                    if (!r2.sources.length) return null;
-                    const pick = r2.sources[srcIdx % r2.sources.length];
-                    srcIdx++;
-                    console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
-                    return [pick.url];
-                };
+                const rState = { provider, idx: 1 };
+                const refresh = makeCrossRefresh('movie', id, 1, 1, rState);
                 const st = await startYtStream([best], selectedQuality, message, res.title, refresh, subPath);
                 vlCleanupSub(subPath);
                 isPlaying = false;
@@ -1115,23 +1148,8 @@ client.on('messageCreate', async (message) => {
                 currentChannelName = res.title;
                 await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...${subPathTv ? ' 📝 بالترجمة العربية' : ''}`);
                 console.log(`[${provider}] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}${subPathTv ? ' +subs' : ''}`);
-                let srcIdxTv = 1;
-                const refreshTv = async () => {
-                    if (provider === 'VL') {
-                        const r2 = await vlSources('tv', parts[0], s, e);
-                        if (!r2 || !r2.sources.length) return null;
-                        const pick = r2.sources[srcIdxTv % r2.sources.length];
-                        srcIdxTv++;
-                        console.log(`[VL] refresh -> ${pick.server} ${pick.quality}`);
-                        return [pick];
-                    }
-                    const r2 = await vkSources('tv', parts[0], s, e);
-                    if (!r2.sources.length) return null;
-                    const pick = r2.sources[srcIdxTv % r2.sources.length];
-                    srcIdxTv++;
-                    console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
-                    return [pick.url];
-                };
+                const rStateTv = { provider, idx: 1 };
+                const refreshTv = makeCrossRefresh('tv', parts[0], s, e, rStateTv);
                 const st2 = await startYtStream([best], selectedQuality, message, res.title, refreshTv, subPathTv);
                 vlCleanupSub(subPathTv);
                 isPlaying = false;
