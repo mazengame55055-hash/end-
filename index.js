@@ -688,9 +688,9 @@ client.on('messageCreate', async (message) => {
             }
         }
 
-        if (message.content.startsWith('!tv ') || message.content.startsWith('!مسلسل ')) {
+        if (message.content.startsWith('!series ') || message.content.startsWith('!مسلسل ')) {
             const parts = message.content.split(' ').slice(1);
-            if (!parts[0]) return reply(message, '❌ الاستخدام:\n`!tv بريكنج باد` للبحث\n`!tv 1396` للموسم 1 حلقة 1\n`!tv 1396 2 5` لموسم وحلقة محددة');
+            if (!parts[0]) return reply(message, '❌ الاستخدام:\n`!series بريكنج باد` للبحث\n`!series 1396` للموسم 1 حلقة 1\n`!series 1396 2 5` لموسم وحلقة محددة');
             if (!TMDB_API_KEY) return reply(message, '❌ مفتاح TMDB غير مضبوط.');
 
             await reply(message, '🔍 جاري البحث...');
@@ -713,7 +713,7 @@ client.on('messageCreate', async (message) => {
                 const query = parts.join(' ');
                 const results = await tmdbSearch('tv', query);
                 if (!results || results.length === 0) return reply(message, '❌ مفيش نتائج. جرّب اسم تاني.');
-                const list = results.slice(0, 5).map((x) => `${fmtTmdbLine(x)}\n↳ تشغيل: \`!tv ${x.id}\``).join('\n');
+                const list = results.slice(0, 5).map((x) => `${fmtTmdbLine(x)}\n↳ تشغيل: \`!series ${x.id}\``).join('\n');
                 await reply(message, `📺 **نتائج البحث:**\n\n${list}`);
             } catch (err) {
                 console.error('[TMDB] tv error:', err.message);
@@ -840,7 +840,13 @@ client.on('messageCreate', async (message) => {
                 '`!help` - المساعدة',
                 '',
                 '**الجودات:** 240p, 360p, 480p, 720p, 720pf, 1080p, 1440p, 4k, 8k',
-            ].join('\n');
+                            '',
+                '**🎬 أفلام ومسلسلات:**',
+                '`!movie <اسم>` - بحث عن فيلم',
+                '`!movie <id>` - تفاصيل + لينك مشاهدة',
+                '`!series <اسم>` - بحث عن مسلسل',
+                '`!series <id> <موسم> <حلقة>` - مشاهدة حلقة',
+].join('\n');
             await reply(message, helpTxt);
         }
 
