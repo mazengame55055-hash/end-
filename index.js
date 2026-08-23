@@ -377,6 +377,98 @@ function fmtTmdbLine(x) {
     return `**${t}** ${y ? `(${y})` : ''} ${r} \`${x.id}\``;
 }
 
+// ===== Vidking stream extraction =====
+const VK_API = 'https://api.speedracelight.com';
+const vkDecrypt = (function () {
+    const Ys = [109, 118, 109, 49];
+    const ms = 2654435769, Js = 61, Sf = 8;
+    const Hl = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580];
+    const _f = [0];
+    function If(l) { return (l * (l + 1) & 1) === 1; }
+    function wf(l) { const o = new Array(256); for (let i = 0; i < 256; i++) o[i] = i; let e = 0; for (let i = 0; i < 256; i++) { e = e + o[i] + l.charCodeAt(i % l.length) & 255; const r = o[i]; o[i] = o[e], o[e] = r } return o }
+    function Af(l) { let o = _f[0] >>> 0; for (let e = 0; e < l.length; e++) o = ps((o ^ Math.imul(l.charCodeAt(e), Hl[e & 15])) >>> 0, 5); return ci(o) }
+    function ci(l) { return l >>>= 0, l ^= l >>> 16, l = Math.imul(l, 2246822507) >>> 0, l ^= l >>> 13, l = Math.imul(l, 3266489909) >>> 0, l ^= l >>> 16, l >>> 0 }
+    function vf(l) { let o = 2166136261; for (let e = 0; e < l.length; e++) o = Math.imul(o ^ l.charCodeAt(e), 16777619) >>> 0; return ci(o) }
+    function ps(l, o) { return l >>>= 0, o &= 31, o === 0 ? l >>> 0 : (l << o | l >>> 32 - o) >>> 0 }
+    const bf = l => (l * (l + 1) & 1) === 0;
+    function Nf(l, o, e) { return ((l ^ o) >>> 0 | (l & o & e) >>> 0) >>> 0 }
+    function Rf(l, o) { if (If(l.length)) return { S: wf(l), acc: Af(l) }; const e = new Array(Js); let i = ci(vf(l) ^ ci(o >>> 0 ^ ms)) >>> 0; for (let r = 0; r < Sf; r++) if (bf(r)) { const n = i % Js; i = ps(i + ms >>> 0, 7 + (r & 7)), e[n] = (i ^ ci(i)) >>> 0, i = ci(i + n >>> 0) } else e[r] = Hl[r & 15]; return { S: e, acc: ci(i ^ 2779096485) >>> 0 } }
+    function Cf(l, o) { const e = l.S; let i = l.acc; const r = i % Js, n = 0 - +(r in e), u = e[r] >>> 0, d = Math.imul(ms, o + 1) >>> 0; let g = Nf(i, (u ^ d) >>> 0, n); return g = (ps(g + i >>> 0, r & 31) ^ ps(i, Math.imul(r, 7) & 31)) >>> 0, i = ci(g + ms >>> 0), e[r] = i >>> 0, l.acc = i, i >>> 0 }
+    function xf(l, o, e) { const i = Rf(l, o), r = new Uint8Array(e); let n = 0; for (let u = 0; u < e;) { const d = Cf(i, n++); r[u++] = d & 255, u < e && (r[u++] = d >>> 8 & 255), u < e && (r[u++] = d >>> 16 & 255), u < e && (r[u++] = d >>> 24 & 255) } return r }
+    function Df(l) { const o = l.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(l.length / 4) * 4, '='), e = atob(o), i = new Uint8Array(e.length); for (let r = 0; r < e.length; r++) i[r] = e.charCodeAt(r); return i }
+    function Pf(l, o, e) { const i = Df(l), r = xf(o, e, i.length); for (let n = 0; n < i.length; n++) i[n] ^= r[n]; for (let n = 0; n < Ys.length; n++) if (i[n] !== Ys[n]) throw new Error('decrypt failed'); return new TextDecoder('utf-8').decode(i.subarray(Ys.length)) }
+    return Pf;
+})();
+
+async function vkGetSeed(tmdbId) {
+    const r = await fetch(`${VK_API}/seed?mediaId=${encodeURIComponent(String(tmdbId))}`, { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('seed http ' + r.status);
+    return r.json();
+}
+
+async function vkSources(type, tmdbId, season, episode) {
+    const metaR = await fetch(`https://db.speedracelight.com/3/${type}/${tmdbId}?append_to_response=external_ids`, { signal: AbortSignal.timeout(15000) });
+    if (!metaR.ok) throw new Error('meta http ' + metaR.status);
+    const meta = await metaR.json();
+    const title = meta.title || meta.name || '';
+    const year = String((meta.release_date || meta.first_air_date || '').slice(0, 4));
+    const imdbId = (meta.external_ids && meta.external_ids.imdb_id) || '';
+
+    const { seed } = await vkGetSeed(tmdbId);
+
+    const servers = [
+        { name: 'Yoru', endpoint: 'cdn/sources-with-title' },
+        { name: 'Breach', endpoint: 'm4uhd/sources-with-title' },
+        { name: 'Omen', endpoint: 'lamovie/sources-with-title' },
+        { name: 'Killjoy', endpoint: 'meine/sources-with-title', params: { language: 'german' } },
+        { name: 'Cypher', endpoint: 'downloader2/sources-with-title' },
+        { name: 'Neon', endpoint: 'vsrc/sources-with-title' },
+        { name: 'Raze', endpoint: 'superflix/sources-with-title' },
+    ];
+
+    const found = [];
+    for (const srv of servers) {
+        try {
+            const E = new URL(`${VK_API}/${srv.endpoint}`);
+            E.searchParams.append('title', title);
+            E.searchParams.append('mediaType', type);
+            E.searchParams.append('year', year);
+            E.searchParams.append('episodeId', String(episode || '1'));
+            E.searchParams.append('seasonId', String(season || '1'));
+            E.searchParams.append('tmdbId', String(tmdbId));
+            E.searchParams.append('imdbId', imdbId);
+            E.searchParams.append('enc', '2');
+            E.searchParams.append('seed', seed);
+            if (srv.params) for (const [k, v] of Object.entries(srv.params)) E.searchParams.append(k, v);
+            const r = await fetch(E.toString(), {
+                headers: {
+                    Referer: 'https://www.vidking.net/',
+                    Origin: 'https://www.vidking.net',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+                    Accept: '*/*',
+                },
+                signal: AbortSignal.timeout(20000),
+            });
+            if (!r.ok) continue;
+            const data = JSON.parse(vkDecrypt(await r.text(), seed, parseInt(tmdbId)));
+            const arr = Array.isArray(data && data.sources) ? data.sources : [];
+            for (const q of arr) {
+                if (q && typeof q.url === 'string' && /^https?:\/\/.+\.m3u8/.test(q.url)) {
+                    found.push({ url: q.url, quality: q.quality || 'auto', server: srv.name });
+                }
+            }
+            if (found.length >= 2) break;
+        } catch (_) { /* try next server */ }
+    }
+    return { title, year, sources: found };
+}
+
+function vkPickBest(sources) {
+    const score = (q) => /1080/.test(q.quality) ? 4 : /720/.test(q.quality) ? 3 : /auto|hls/i.test(q.quality) ? 2 : /480|360/.test(q.quality) ? 1 : 0;
+    return [...sources].sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+
 async function getYtDlpInfo(url) {
     const cookiesArg = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
     try {
@@ -675,6 +767,7 @@ client.on('messageCreate', async (message) => {
                     let msg = `🎬 **${m.title}** ${year ? `(${year})` : ''}\n⭐ ${Number(m.vote_average).toFixed(1)}/10`;
                     if (m.overview) msg += `\n\n📝 ${m.overview.slice(0, 300)}`;
                     msg += `\n\n▶️ **شاهد الآن:**\n${vkMovieUrl(m.id)}`;
+                    msg += `\n🎙️ للبث في الروم: \`!playmovie ${m.id}\``;
                     if (m.poster_path) msg += `\n\n${TMDB_IMG}${m.poster_path}`;
                     return reply(message, msg);
                 }
@@ -707,6 +800,7 @@ client.on('messageCreate', async (message) => {
                     let msg = `📺 **${m.name}** ${year ? `(${year})` : ''}\n⭐ ${Number(m.vote_average).toFixed(1)}/10 | المواسم: ${m.number_of_seasons} | الحلقات: ${m.number_of_episodes}`;
                     if (m.overview) msg += `\n\n📝 ${m.overview.slice(0, 300)}`;
                     msg += `\n\n▶️ **شاهد الآن — موسم ${s} • حلقة ${e}:**\n${vkTvUrl(id, s, e)}\n\n💡 تقدر تغيّر الحلقة من قائمة الحلقات جوه المشغل.`;
+                    msg += `\n🎙️ للبث في الروم: \`!playseries ${id} ${s} ${e}\``;
                     if (m.poster_path) msg += `\n\n${TMDB_IMG}${m.poster_path}`;
                     return reply(message, msg);
                 }
@@ -718,6 +812,56 @@ client.on('messageCreate', async (message) => {
             } catch (err) {
                 console.error('[TMDB] tv error:', err.message);
                 return reply(message, '❌ حصل خطأ في البحث.');
+            }
+        }
+
+
+        // ===== Vidking playback commands =====
+        if (message.content.startsWith('!playmovie ') || message.content.startsWith('!بثفيلم ')) {
+            const id = message.content.split(' ')[1];
+            if (!id || !/^\d+$/.test(id)) return reply(message, '❌ الاستخدام: `!playmovie <id>` — جيب الـ ID من `!movie <اسم>`');
+            if (isPlaying) return reply(message, '❌ يوجد بث قيد التشغيل. استعمل `!stop` أولاً.');
+            await reply(message, '🔍 جاري استخراج البث...');
+            try {
+                const res = await vkSources('movie', id, 1, 1);
+                const best = vkPickBest(res.sources);
+                if (!best) return reply(message, '❌ مفيش مصادر متاحة للفيلم ده حالياً. جرّب بعدين.');
+                isPlaying = true;
+                currentChannelName = res.title;
+                await reply(message, `🎬 جاري بث **${res.title}** في الروم...`);
+                console.log(`[VK] movie ${id} via ${best.server} ${best.quality}`);
+                await startYtStream([best.url], selectedQuality, message, res.title);
+                isPlaying = false;
+                await reply(message, `⏹️ انتهى بث **${res.title}**`);
+            } catch (e) {
+                isPlaying = false;
+                console.error('[VK] movie error:', e.message);
+                return reply(message, '❌ فشل استخراج البث.');
+            }
+        }
+
+        if (message.content.startsWith('!playseries ') || message.content.startsWith('!بثمسلسل ')) {
+            const parts = message.content.split(' ').slice(1);
+            if (!parts[0] || !/^\d+$/.test(parts[0])) return reply(message, '❌ الاستخدام:\n`!playseries <id>` موسم 1 حلقة 1\n`!playseries <id> 2 5` موسم وحلقة محددة');
+            if (isPlaying) return reply(message, '❌ يوجد بث قيد التشغيل. استعمل `!stop` أولاً.');
+            const s = parseInt(parts[1], 10) || 1;
+            const e = parseInt(parts[2], 10) || 1;
+            await reply(message, '🔍 جاري استخراج البث...');
+            try {
+                const res = await vkSources('tv', parts[0], s, e);
+                const best = vkPickBest(res.sources);
+                if (!best) return reply(message, '❌ مفيش مصادر متاحة للحلقة دي حالياً. جرّب بعدين.');
+                isPlaying = true;
+                currentChannelName = res.title;
+                await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...`);
+                console.log(`[VK] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}`);
+                await startYtStream([best.url], selectedQuality, message, res.title);
+                isPlaying = false;
+                await reply(message, `⏹️ انتهى بث **${res.title}** S${s}E${e}`);
+            } catch (e2) {
+                isPlaying = false;
+                console.error('[VK] series error:', e2.message);
+                return reply(message, '❌ فشل استخراج البث.');
             }
         }
 
@@ -846,6 +990,8 @@ client.on('messageCreate', async (message) => {
                 '`!movie <id>` - تفاصيل + لينك مشاهدة',
                 '`!series <اسم>` - بحث عن مسلسل',
                 '`!series <id> <موسم> <حلقة>` - مشاهدة حلقة',
+                '`!playmovie <id>` - بث الفيلم في الروم الصوتي',
+                '`!playseries <id> [موسم] [حلقة]` - بث الحلقة في الروم',
 ].join('\n');
             await reply(message, helpTxt);
         }
