@@ -48,8 +48,16 @@ async function reply(msg, text) {
 }
 
 const TOKEN = process.env.TOKEN;
-const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
-const VIDKING_COLOR = process.env.VIDKING_COLOR || 'e50914';
+function readEnvKey(name) {
+    if (process.env[name]) return process.env[name];
+    try {
+        const line = fs.readFileSync(path.join(__dirname, '.env'), 'utf8')
+            .split('\n').find((l) => l.trim().startsWith(name + '='));
+        return line ? line.slice(name.length + 1).trim().replace(/^["']|["']$/g, '') : '';
+    } catch (_) { return ''; }
+}
+const TMDB_API_KEY = readEnvKey('TMDB_API_KEY');
+const VIDKING_COLOR = readEnvKey('VIDKING_COLOR') || 'e50914';
 let GUILD_ID = '1324034047613079574';
 let VOICE_ID = '1538500580568203365';
 const MAIN_OWNER = '820408813790167041';
