@@ -1,3 +1,6 @@
 node_modules/
 channels.txt
 .env
+cookies.txt
+*.bak*
+voice_config.json
