@@ -97,6 +97,17 @@ let pendingSeek = null;
 let seekOffset = 0;
 let activePlayPromise = null;
 let seekFails = 0;
+let streamBytes = 0;
+let lastProgressAt = 0;
+
+setInterval(() => {
+    if (!isPlaying || isPaused || !ffmpegProcess) return;
+    if (lastProgressAt && Date.now() - lastProgressAt > 12000) {
+        console.log('[Watchdog] no stream data for >12s, restarting');
+        lastProgressAt = Date.now();
+        killFFmpeg();
+    }
+}, 5000);
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
 const RECONNECT_DELAY = 8000;
@@ -332,6 +343,9 @@ async function startStream(channel, message) {
 
                 const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 2 });
                 bufferStream.on('error', () => {});
+                streamBytes = 0;
+                lastProgressAt = Date.now();
+                bufferStream.on('data', (d) => { streamBytes += d.length; lastProgressAt = Date.now(); });
                 ffmpegProcess.stdout.pipe(bufferStream);
                 mediaBufferStream = bufferStream;
                 if (mediaInfo) { mediaInfo.runStartedAt = Date.now(); }
@@ -630,6 +644,9 @@ async function startYtStream(urls, quality, message, title, refresher) {
 
                 const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 2 });
                 bufferStream.on('error', () => {});
+                streamBytes = 0;
+                lastProgressAt = Date.now();
+                bufferStream.on('data', (d) => { streamBytes += d.length; lastProgressAt = Date.now(); });
                 ffmpegProcess.stdout.pipe(bufferStream);
                 mediaBufferStream = bufferStream;
                 if (mediaInfo) { mediaInfo.offsetBase = seekOffset; mediaInfo.runStartedAt = Date.now(); }
@@ -708,6 +725,7 @@ async function startYtStream(urls, quality, message, title, refresher) {
     killFFmpeg();
     try { streamer.stopStream(); } catch (_) {}
     try { streamer.leaveVoice(); } catch (_) {}
+    return reconnectAttempts >= MAX_RECONNECT ? 'failed' : 'ended';
 }
 
 client.on('ready', async () => {
@@ -931,9 +949,9 @@ client.on('messageCreate', async (message) => {
                     const b2 = vkPickBest(r2.sources);
                     return b2 ? [b2.url] : null;
                 };
-                await startYtStream([best.url], selectedQuality, message, res.title, refresh);
+                const st = await startYtStream([best.url], selectedQuality, message, res.title, refresh);
                 isPlaying = false;
-                await reply(message, `⏹️ انتهى بث **${res.title}**`);
+                await reply(message, st === 'failed' ? `⚠️ اتوقف بث **${res.title}** بسبب ضغط على سيرفر الفيديو — جرّب تاني بعد دقيقة.` : `⏹️ انتهى بث **${res.title}**`);
             } catch (e) {
                 isPlaying = false;
                 console.error('[VK] movie error:', e.message);
@@ -961,9 +979,9 @@ client.on('messageCreate', async (message) => {
                     const b2 = vkPickBest(r2.sources);
                     return b2 ? [b2.url] : null;
                 };
-                await startYtStream([best.url], selectedQuality, message, res.title, refreshTv);
+                const st2 = await startYtStream([best.url], selectedQuality, message, res.title, refreshTv);
                 isPlaying = false;
-                await reply(message, `⏹️ انتهى بث **${res.title}** S${s}E${e}`);
+                await reply(message, st2 === 'failed' ? `⚠️ اتوقف بث **${res.title}** بسبب ضغط على سيرفر الفيديو — جرّب تاني بعد دقيقة.` : `⏹️ انتهى بث **${res.title}** S${s}E${e}`);
             } catch (e2) {
                 isPlaying = false;
                 console.error('[VK] series error:', e2.message);
