@@ -99,13 +99,36 @@ let activePlayPromise = null;
 let seekFails = 0;
 let streamBytes = 0;
 let lastProgressAt = 0;
+let ffmpegStderrTail = '';
+let wdLastBytes = 0;
 
+const PROACTIVE_ROTATE_MS = 270000;
 setInterval(() => {
     if (!isPlaying || isPaused || !ffmpegProcess) return;
-    if (lastProgressAt && Date.now() - lastProgressAt > 12000) {
-        console.log('[Watchdog] no stream data for >12s, restarting');
-        lastProgressAt = Date.now();
+    const now = Date.now();
+    const runAge = mediaInfo && mediaInfo.runStartedAt ? now - mediaInfo.runStartedAt : 0;
+    const delta = streamBytes - wdLastBytes;
+    wdLastBytes = streamBytes;
+    if (mediaInfo && !mediaInfo.live && !mediaInfo.paused && runAge > PROACTIVE_ROTATE_MS) {
+        console.log('[Rotate] proactive source rotation (fresh URL) at ' + Math.round(runAge / 1000) + 's');
+        console.log('[ffmpeg] stderr tail:\n' + ffmpegStderrTail.split('\n').slice(-5).join('\n'));
+        lastProgressAt = now;
         killFFmpeg();
+        return;
+    }
+    const starved = now - lastProgressAt > 12000;
+    const trickling = runAge > 20000 && delta < 30000 && now - lastProgressAt < 12000;
+    if (starved || trickling) {
+        console.log(`[Watchdog] ${starved ? 'no data >12s' : 'trickling data (' + delta + 'B in 5s)'}, restarting`);
+        console.log('[ffmpeg] stderr tail:\n' + ffmpegStderrTail.split('\n').slice(-8).join('\n'));
+        lastProgressAt = now;
+        wdLastBytes = streamBytes;
+        killFFmpeg();
+        return;
+    }
+    if (runAge > 30000 && delta >= 30000 && reconnectAttempts > 0) {
+        reconnectAttempts = 0;
+        console.log('[YT] healthy playback, reconnect budget restored');
     }
 }, 5000);
 let reconnectAttempts = 0;
@@ -788,9 +811,11 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 ];
 
                 ffmpegProcess = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+                ffmpegStderrTail = '';
+                wdLastBytes = 0;
 
                 let stderrLog = '';
-                ffmpegProcess.stderr.on('data', (c) => { stderrLog += c.toString(); });
+                ffmpegProcess.stderr.on('data', (c) => { stderrLog += c.toString(); ffmpegStderrTail = (ffmpegStderrTail + c.toString()).slice(-1600); });
                 ffmpegProcess.stdout.on('error', () => {});
                 ffmpegProcess.on('error', (err) => reject(err));
                 ffmpegProcess.on('exit', (code, signal) => {
