@@ -23,7 +23,44 @@ if (fs.existsSync(libavPath)) {
 }
 
 const { Client } = require('discord.js-selfbot-v13');
-const { Streamer, playStream } = require('@dank074/discord-video-stream');
+if (typeof globalThis.navigator === 'undefined') {
+    globalThis.navigator = { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) Node/20', hardwareConcurrency: 4, language: 'en-US', languages: ['en-US'], platform: 'Linux' };
+}
+let Streamer = null, playStream = null;
+const streamModReady = import('@dank074/discord-video-stream').then(m => {
+    Streamer = m.Streamer;
+    const rawPlay = typeof m.playStream === 'function' ? m.playStream : null;
+    const legacyPlay = typeof m.streamLivestreamVideo === 'function' ? m.streamLivestreamVideo : null;
+    if (!rawPlay && !legacyPlay) throw new Error('no playable export found');
+    playStream = function (input, streamerInst, opts) {
+        const qopts = {};
+        if (opts) {
+            if (opts.width) qopts.width = opts.width;
+            if (opts.height) qopts.height = opts.height;
+            const fps = opts.frameRate || opts.fps;
+            if (fps) qopts.frameRate = fps;
+        }
+        if (rawPlay && m.prepareStream) {
+            let prepared;
+            try {
+                prepared = m.prepareStream(input, { noTranscoding: true, ...qopts });
+                console.log('[MOD] passthrough mode (no re-encode)');
+            } catch (e0) {
+                console.log('[MOD] passthrough unavailable, transcoding:', String(e0 && e0.message || e0).slice(0, 100));
+                const enc = m.Encoders.software({ x264: { preset: 'superfast' } });
+                prepared = m.prepareStream(input, { encoder: enc, ...qopts, bitrateVideo: 2500, bitrateVideoMax: 4000, videoCodec: m.Utils.normalizeVideoCodec('H264') });
+            }
+            return Promise.resolve(rawPlay(prepared.output, streamerInst, qopts)).catch(e1 => {
+                console.error('[MOD] play attempt failed, retrying with explicit encoder:', String(e1 && e1.message || e1).slice(0, 120));
+                const enc = m.Encoders.software({ x264: { preset: 'superfast' } });
+                const t = m.prepareStream(input, { encoder: enc, ...qopts, bitrateVideo: 2500, bitrateVideoMax: 4000, videoCodec: m.Utils.normalizeVideoCodec('H264') });
+                return rawPlay(t.output, streamerInst, qopts);
+            });
+        }
+        const sopts = { ...qopts };
+        return Promise.resolve(streamerInst.createStream(sopts)).then(udp => legacyPlay(input, udp));
+    };
+}).catch(e => console.error('[MOD] stream lib load failed:', e.message));
 const { spawn } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
 
@@ -41,13 +78,13 @@ if (process.platform === 'linux') {
 }
 
 const client = new Client();
-const streamer = new Streamer(client);
+let streamer = null;
 
 async function reply(msg, text) {
     try { await msg.reply(text); } catch (e) { console.log('[reply blocked]', e.message); }
 }
 
-const TOKEN = process.env.TOKEN;
+const TOKEN = readEnvKey('TOKEN');
 function readEnvKey(name) {
     if (process.env[name]) return process.env[name];
     try {
@@ -101,6 +138,7 @@ let streamBytes = 0;
 let lastProgressAt = 0;
 let ffmpegStderrTail = '';
 let wdLastBytes = 0;
+let wdTrickleStreak = 0;
 
 const PROACTIVE_ROTATE_MS = 270000;
 setInterval(() => {
@@ -118,8 +156,10 @@ setInterval(() => {
     }
     const starved = now - lastProgressAt > 12000;
     const trickling = runAge > 20000 && delta < 30000 && now - lastProgressAt < 12000;
-    if (starved || trickling) {
-        console.log(`[Watchdog] ${starved ? 'no data >12s' : 'trickling data (' + delta + 'B in 5s)'}, restarting`);
+    wdTrickleStreak = trickling ? wdTrickleStreak + 1 : 0;
+    if (starved || (trickling && wdTrickleStreak >= 2)) {
+        console.log(`[Watchdog] ${starved ? 'no data >12s' : 'trickling x' + wdTrickleStreak + ' (' + delta + 'B in 5s)'}, restarting`);
+        wdTrickleStreak = 0;
         console.log('[ffmpeg] stderr tail:\n' + ffmpegStderrTail.split('\n').slice(-8).join('\n'));
         lastProgressAt = now;
         wdLastBytes = streamBytes;
@@ -531,10 +571,11 @@ async function vkSources(type, tmdbId, season, episode) {
     return { title, year, sources: found };
 }
 
-function vkPickBest(sources, prefQuality) {
+function vkPickBest(sources, prefQuality, returnList) {
     const base = (q) => /1080/.test(q.quality) ? 4 : /720/.test(q.quality) ? 3 : /auto|hls/i.test(q.quality) ? 2 : /480|360/.test(q.quality) ? 1 : 0;
     const score = (q) => (prefQuality && new RegExp(prefQuality).test(q.quality) ? base(q) + 10 : base(q));
-    return [...sources].sort((a, b) => score(b) - score(a))[0] || null;
+    const sorted = [...sources].sort((a, b) => score(b) - score(a));
+    return returnList ? sorted : (sorted[0] || null);
 }
 
 // ===== VidLink stream extraction =====
@@ -606,8 +647,9 @@ async function vlSources(type, tmdbId, season, episode) {
     } catch (_) {}
 
     const out = [];
+    const vlDefHdrs = () => ({ 'user-agent': CC_UA, referer: `${VL_BASE}/` });
     if (typeof st.playlist === 'string') {
-        out.push({ url: st.playlist, quality: 'hls', server: 'VidLink', headers: st.playlistHeaders || undefined });
+        out.push({ url: st.playlist, quality: 'hls', server: 'VidLink', headers: { ...vlDefHdrs(), ...(st.playlistHeaders || {}) } });
     }
     if (st.qualities && typeof st.qualities === 'object') {
         const order = ['1080', '720', '480', '360'];
@@ -618,7 +660,8 @@ async function vlSources(type, tmdbId, season, episode) {
         for (const k of keys) {
             const q = st.qualities[k];
             if (!q || typeof q.url !== 'string') continue;
-            const hdrs = q.headers && q.headers.referer ? { referer: q.headers.referer, origin: q.headers.origin } : undefined;
+            const apiH = (q.headers && typeof q.headers === 'object') ? q.headers : {};
+            const hdrs = { ...vlDefHdrs(), ...apiH };
             out.push({ url: q.url, quality: String(k), server: 'VidLink', headers: hdrs });
         }
     }
@@ -639,17 +682,85 @@ async function vlFetchArabicSub(subUrl) {
         if (!r.ok) return null;
         let buf = Buffer.from(await r.arrayBuffer());
         if (buf.length < 10 || !buf.toString('utf8').includes('-->')) return null;
-        const cleaned = buf.toString('utf8')
+        let cleaned = buf.toString('utf8')
+            .normalize('NFKC')
+            .replace(/[\u202A-\u202E\u200E\u200F\u2066-\u2069\u200B-\u200D\u00AD\u2060]/g, '')
             .replace(/\uFEFF/g, '')
-            .replace(/\r\n/g, '\n')
-            .replace(/\n{3,}/g, '\n\n')
-            .trim() + '\n';
+            .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{2190}-\u{21FF}\u{2500}-\u{25FF}]/gu, '')
+            .replace(/\[\s*\]/g, '')
+            .replace(/\[([^\]\n]{1,80})\]/g, '($1)')
+            .replace(/[\[\]]/g, '')
+            .replace(/\{\\[^{}]*\}/g, '')
+            .replace(/[{}]/g, '')
+            .replace(/\r\n/g, '\n');
+        const isVtt = /^WEBVTT/i.test(cleaned.trim()) || /\.vtt(\?|$)/i.test(subUrl);
+        const spamRe = /hoofoot|opensubtitles\.org|facebook\.com|instagram\.com|t\.me\/|telegram|subtitle.*by|synced.*by|ترجمة|تعريب|ترجمت/gi;
+        if (isVtt) {
+            const normTs = (t) => {
+                t = String(t || '').trim();
+                const p = t.split(':');
+                if (p.length === 2) p.unshift('00');
+                if (p.length !== 3) return '';
+                return `${p[0].padStart(2, '0')}:${p[1].padStart(2, '0')}:${p[2].replace('.', ',').padStart(6, '0')}`;
+            };
+            cleaned = cleaned.replace(/^WEBVTT[^\n]*\n?/, '');
+            const blocks = cleaned.split(/\n{2,}/);
+            const out = [];
+            let n = 0;
+            for (const b of blocks) {
+                const ls = b.split('\n');
+                const ti = ls.findIndex((l) => l.includes('-->'));
+                if (ti === -1) continue;
+                const sides = ls[ti].split('-->');
+                if (sides.length !== 2) continue;
+                const st = normTs(sides[0]);
+                const en = normTs(sides[1]);
+                const textLines = ls.slice(ti + 1)
+                    .map((l) => l.replace(/<[^>]+>/g, '').trim())
+                    .filter(Boolean);
+                if (!textLines.length || !st || !en) continue;
+                if (textLines.every((l) => spamRe.test(l))) { spamRe.lastIndex = 0; continue; }
+                spamRe.lastIndex = 0;
+                n++;
+                out.push(`${n}\n${st} --> ${en}\n${textLines.join('\n')}`);
+            }
+            if (!out.length) return null;
+            cleaned = out.join('\n\n') + '\n';
+        }
+        cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim() + '\n';
         buf = Buffer.from(cleaned, 'utf8');
         const p = `/tmp/vlsub_${process.pid}_${Date.now()}.srt`;
         fs.writeFileSync(p, buf);
-        console.log(`[VL] arabic subs saved: ${p} (${buf.length} bytes)`);
+        console.log(`[VL] arabic subs saved: ${p} (${buf.length} bytes${isVtt ? ', vtt->srt' : ''})`);
         return p;
     } catch (_) { return null; }
+}
+
+async function stSources(type, id, s, e) {
+    try {
+        const api = type === 'movie'
+            ? `https://api.shows.st/movie?id=${id}&mode=json&srv=moviebox`
+            : `https://api.shows.st/tv?id=${id}&season=${s || 1}&episode=${e || 1}&mode=json&srv=moviebox`;
+        const txt = await ccFetch(api);
+        const j = JSON.parse(txt);
+        if (!j.source || !j.source.url) { console.log('[ST] no source'); return null; }
+        let subUrl = null;
+        if (Array.isArray(j.subtitles)) {
+            const ar = j.subtitles.find(x => x && x.file && (/^arabic(\b|\d)/i.test(x.label || '') || /\/Arabic[^\/]*\.vtt$/i.test(x.file)));
+            if (ar) subUrl = ar.file;
+        }
+        const meta = j.meta || {};
+        console.log(`[ST] ok (${type})${subUrl ? ' +arabic-sub' : ''}`);
+        return {
+            title: meta.title || meta.name || '',
+            year: meta.release_date ? String(meta.release_date).slice(0, 4) : '',
+            sources: [{ url: j.source.url, quality: '720', server: '111movies', extPicky: true }],
+            subUrl,
+        };
+    } catch (err) {
+        console.error('[ST] sources error:', err.message);
+        return null;
+    }
 }
 
 function vlCleanupSub(p) {
@@ -670,131 +781,415 @@ async function ccFetch(url, referer) {
     return fetch(url, { headers: hdrs, signal: AbortSignal.timeout(20000) }).then(r => r.text());
 }
 
-function ccUnpackPacker(html) {
-    let m = html.match(/\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('(.)'\)/s);
-    if (!m) return null;
-    let p = m[1];
-    const a = +m[2], c = +m[3], k = m[4].split(m[5]);
-    const digs = '0123456789abcdefghijklmnopqrstuvwxyz';
-    const toBase = (n, b) => { let s2 = ''; while (n > 0) { s2 = digs[n % b] + s2; n = Math.floor(n / b); } return s2 || '0'; };
-    for (let i = c - 1; i >= 0; i--) {
-        if (k[i]) p = p.replace(new RegExp('\\b' + toBase(i, a) + '\\b', 'g'), () => k[i].replace(/\\/g, '\\\\'));
+const VN_ALPHA = 'RB0fpH8ZEyVLkv7c2i6MAJ5u3IKFDxlS1NTsnGaqmXYdUrtzjwObCgQP94hoeW+/=';
+function vnDecrypt(data) {
+    const map = {};
+    [...VN_ALPHA].forEach((c, i) => { map[c] = i; });
+    let s = String(data || '');
+    while (s.length % 4) s += '=';
+    const out = [];
+    for (let i = 0; i < s.length; i += 4) {
+        const l = [0, 1, 2, 3].map(j => (map[s[i + j]] !== undefined ? map[s[i + j]] : 64));
+        out.push((l[0] << 2) | (l[1] >> 4));
+        if (l[2] !== 64) out.push(((l[1] & 15) << 4) | (l[2] >> 2));
+        if (l[3] !== 64) out.push(((l[2] & 3) << 6) | l[3]);
     }
-    return p.replace(/\\'/g, "'");
+    const str = Buffer.from(out).toString('utf8');
+    try { return JSON.parse(str); } catch (_) { return {}; }
 }
 
+const VN_EPS = ['hollymoviehd', 'videasy', 'rogflix', 'vidzee', 'nextgencloudfabric', 'buzz', 'allmovies'];
 async function ccSources(type, id, s, e) {
+    for (const ep of VN_EPS) {
+        try {
+            const api = type === 'movie'
+                ? `https://new.vidnest.fun/${ep}/movie/${id}`
+                : `https://new.vidnest.fun/${ep}/tv/${id}/${s || 1}/${e || 1}`;
+            const txt = await ccFetch(api, 'https://cineby.hair/');
+            const j = JSON.parse(txt);
+            const dec = j.encrypted ? vnDecrypt(j.data) : j;
+            const streams = dec.streams || dec.sources || [];
+            const good = (Array.isArray(streams) ? streams : []).filter(x => x && x.url);
+            if (!good.length) continue;
+            const out = good.map(x => ({
+                url: x.url,
+                quality: x.quality || '720',
+                server: '2Embed',
+                ...(x.type === 'hls' ? { extPicky: true } : {}),
+                ...(x.headers && Object.keys(x.headers).length ? { headers: x.headers } : {}),
+            }));
+            console.log(`[CC] ${ep}: ${out.length} sources`);
+            return { title: '', year: '', sources: out, subUrl: null };
+        } catch (_) {}
+    }
+    console.log('[CC] all endpoints failed');
+    return null;
+}
+
+let _mgCache = { key: '', t: 0, out: null };
+async function mgSources(type, id, s, e) {
+    const key = `${type}/${id}/${s || 1}/${e || 1}`;
+    if (_mgCache.key === key && _mgCache.out && Date.now() - _mgCache.t < 8 * 60000) {
+        return { title: '', year: '', sources: _mgCache.out, subUrl: null };
+    }
     try {
-        if (type === 'movie') {
-            const em = await ccFetch(`https://www.2embed.cc/embed/${id}`);
-            const vid = (em.match(/streamsrcs\.2embed\.cc\/swish\?id=([A-Za-z0-9]+)/) || [])[1];
-            if (!vid) { console.log('[CC] no swish id'); return null; }
-            const ph = await ccFetch(`https://2vcdn.skin/e/${vid}`, 'https://streamsrcs.2embed.cc/');
-            const js = ccUnpackPacker(ph);
-            if (!js) { console.log('[CC] unpack fail'); return null; }
-            const urls = [...new Set((js.replace(/\\\//g, '/').match(/https?:\/\/[^\s"'<>]+/g) || []))];
-            const txt = urls.find(u => u.includes('master.txt')) || urls.find(u => u.includes('.m3u8'));
-            if (!txt) { console.log('[CC] no stream url in packer'); return null; }
-            console.log('[CC] movie ok (HLS)');
-            return {
-                title: '', year: '',
-                sources: [{ url: txt, quality: '720', server: '2Embed', extPicky: true, headers: { referer: 'https://2vcdn.skin/' } }],
-                subUrl: null,
-            };
-        }
-        const em = await ccFetch(`https://www.2embed.cc/embedtv/${id}&s=${s}&e=${e}`);
-        if (!em.includes('xps-tv')) { console.log('[CC] no xps-tv ref'); return null; }
-        const xps = await ccFetch(`https://streamsrcs.2embed.cc/xps-tv?tmdb=${id}&s=${s}&e=${e}`, 'https://www.2embed.cc/');
-        let path = null;
-        const ifrRe = /<iframe\b[^>]*>/g;
-        let im;
-        while ((im = ifrRe.exec(xps)) !== null) {
-            if (im[0].includes('id="framesrc"')) {
-                const sm = im[0].match(/src="([^"]+)"/);
-                if (sm) path = sm[1];
-                break;
-            }
-        }
-        if (!path) { console.log('[CC] no framesrc path'); return null; }
-        const vh = await ccFetch(`https://videm.xyz/embed/tv/${path}`, 'https://streamsrcs.2embed.cc/');
-        const qm = vh.match(/Q\s*=\s*(\{.*?\});/s);
-        if (!qm) { console.log('[CC] no Q token'); return null; }
-        const q = JSON.parse(qm[1]);
-        const qs2 = `type=tv&id=${encodeURIComponent(q.id)}&s=${q.s}&e=${q.e}&t=${encodeURIComponent(q.t)}`;
-        const sj = JSON.parse(await ccFetch(`https://videm.xyz/api.php?a=sources&${qs2}`, 'https://videm.xyz/'));
-        if (!sj.servers || !sj.servers.length) { console.log('[CC] no servers'); return null; }
-        for (const srv of sj.servers.slice(0, 4)) {
-            try {
-                const pj = JSON.parse(await ccFetch(`https://videm.xyz/api.php?a=play&ref=${srv.ref}`, 'https://videm.xyz/'));
-                if (pj && pj.url) {
-                    const finalUrl = /^https?:\/\//i.test(pj.url) ? pj.url : new URL(pj.url, 'https://videm.xyz/').href;
-                    const isHls = pj.type === 'hls' || /\.(m3u8|txt)(\?|$)/i.test(finalUrl);
-                    console.log(`[CC] tv ok: ${srv.name} (${pj.type})`);
-                    return {
-                        title: (sj.title || '').replace(/\s*Season\s*\d+\s*Episode\s*\d+/i, '').trim(),
-                        year: '',
-                        sources: [{
-                            url: finalUrl,
-                            quality: '720',
-                            server: '2Embed',
-                            ...(isHls ? { extPicky: true, headers: { referer: 'https://videm.xyz/' } } : {}),
-                        }],
-                        subUrl: null,
-                    };
-                }
-            } catch (_) {}
-        }
-        console.log('[CC] all servers failed');
-        return null;
+        const path = type === 'movie'
+            ? `embed/movie/${id}`
+            : `embed/tv/${id}/${s || 1}/${e || 1}`;
+        const html = await ccFetch(`https://megaembed.com/${path}`);
+        if (!html) throw new Error('empty page');
+        const files = [];
+        const re = /"file":"([^"]+?)"/g;
+        let m;
+        while ((m = re.exec(html)) !== null) files.push(m[1]);
+        const uniq = [...new Set(files)];
+        const mp4 = uniq.filter(u => /\.mp4(\?|$)/i.test(u));
+        const hls = uniq.filter(u => /hls\.php|\.m3u8/i.test(u));
+        const ordered = [...mp4, ...hls];
+        if (!ordered.length) { console.log('[MG] no sources in page'); return null; }
+        const out = ordered.map((u, i) => ({
+            url: u,
+            quality: '720',
+            server: `MG-${i + 1}`,
+            ...(/\.m3u8|hls\.php/i.test(u) ? { extPicky: true } : {}),
+        }));
+        _mgCache = { key, t: Date.now(), out };
+        console.log(`[MG] ok: ${out.length} sources (${mp4.length} mp4 direct)`);
+        return { title: '', year: '', sources: out, subUrl: null };
     } catch (err) {
-        console.error('[CC] sources error:', err.message);
+        console.error('[MG] sources error:', err.message);
         return null;
     }
 }
 
-function makeCrossRefresh(type, id, s, e, state) {
-    return async () => {
-        if (state.provider === 'VL') {
+const TR_DIR_PREFIX = '/tmp/trdl_';
+let trActiveProc = null;
+let lastSeriesCtx = null;
+function trKill() {
+    try { if (trActiveProc) { trActiveProc.kill('SIGKILL'); trActiveProc = null; } } catch (_) {}
+    try {
+        for (const f of fs.readdirSync('/tmp')) {
+            if (f.startsWith('trdl_')) { try { fs.rmSync(path.join('/tmp', f), { recursive: true, force: true }); } catch (_) {} }
+        }
+    } catch (_) {}
+}
+async function trSources(type, tmdbId, season, episode) {
+    try {
+        let title = '';
+        try {
+            const mr = await fetch(`https://api.themoviedb.org/3/${type}/${tmdbId}?api_key=${TMDB_API_KEY}`, { signal: AbortSignal.timeout(15000) });
+            const mj = await mr.json();
+            title = mj.title || mj.name || '';
+        } catch (_) {}
+        if (!title && type !== 'tv') return null;
+        let mg = null;
+        if (type === 'movie') {
+            const hits = [];
             try {
-                const r2 = await vlSources(type, id, s, e);
-                if (r2 && r2.sources.length) {
-                    const pick = r2.sources[state.idx % r2.sources.length];
-                    state.idx++;
-                    state.cycleFails = 0;
-                    console.log(`[VL] refresh -> ${pick.quality}`);
-                    return [pick];
+                const yr = await fetch(`https://apibay.org/q.php?q=${encodeURIComponent(title.trim())}`, { signal: AbortSignal.timeout(15000) });
+                const arr = await yr.json();
+                if (Array.isArray(arr)) for (const t of arr) {
+                    if (!t || !t.info_hash || /^0{40}$/.test(t.info_hash)) continue;
+                    const seeds = parseInt(t.seeders || '0', 10);
+                    if (seeds <= 5) continue;
+                    const nm = String(t.name || '');
+                    const isCam = /\b(cam|ts|hdcam|screener)\b/i.test(nm);
+                    if (isCam) continue;
+                    const quality = /2160p/i.test(nm) ? '2160p' : /1080p/i.test(nm) ? '1080p' : /720p/i.test(nm) ? '720p' : null;
+                    if (!quality) continue;
+                    hits.push({ hash: t.info_hash.toLowerCase(), quality, seeds, name: nm });
                 }
             } catch (_) {}
-            console.log('[ROTATE] VL failed -> switching to VK');
+            hits.sort((a, b) => ((b.quality === '1080p') - (a.quality === '1080p')) || (b.seeds - a.seeds));
+            mg = hits[0] || null;
+        } else {
+            try {
+                const er = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}&append_to_response=external_ids`, { signal: AbortSignal.timeout(15000) });
+                const ej = await er.json();
+                const imdb = (((ej.external_ids || {}).imdb_id) || '').replace(/^tt/, '');
+                if (!imdb) return null;
+                if (!title) title = ej.name || 'series';
+                const zr = await fetch(`https://eztvx.to/api/get-torrents?imdb_id=${imdb}&limit=100`, { signal: AbortSignal.timeout(15000) });
+                const arr = (((await zr.json()) || {}).torrents) || [];
+                const want = `s${String(season || 1).padStart(2, '0')}e${String(episode || 1).padStart(2, '0')}`;
+                const cands = [];
+                for (const t of arr) {
+                    const fn = String(t.filename || '');
+                    if (!fn.toLowerCase().includes(want)) continue;
+                    if (/\b(cam|ts|hdcam)\b/i.test(fn)) continue;
+                    const seeds = t.seeds || 0;
+                    if (seeds < 3) continue;
+                    const quality = /2160p/i.test(fn) ? '2160p' : /1080p/i.test(fn) ? '1080p' : /720p/i.test(fn) ? '720p' : '480';
+                    cands.push({ hash: String(t.hash).toLowerCase(), quality, seeds, name: fn });
+                }
+                cands.sort((a, b) => ((b.quality === '1080p') - (a.quality === '1080p')) || (b.seeds - a.seeds));
+                mg = cands[0] || null;
+            } catch (_) {}
+        }
+        if (!mg) { console.log('[TR] no torrents found for', title); return null; }
+        const dir = TR_DIR_PREFIX + tmdbId;
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+        fs.mkdirSync(dir, { recursive: true });
+        console.log(`[TR] torrent fallback: "${title}" ${mg.quality} (${mg.seeds} seeds)...`);
+const TR_TRACKERS = '&tr=' + encodeURIComponent('udp://tracker.opentrackr.org:1337/announce') + '&tr=' + encodeURIComponent('udp://open.tracker.cl:1337/announce') + '&tr=' + encodeURIComponent('udp://exodus.desync.com:6969/announce') + '&tr=' + encodeURIComponent('http://tracker.files.fm:6969/announce') + '&tr=' + encodeURIComponent('wss://tracker.openwebtorrent.com');
+        const wt = spawn(process.execPath, [path.join(__dirname, 'node_modules', 'webtorrent-cli', 'bin', 'cmd.js'), 'download', `magnet:?xt=urn:btih:${mg.hash}&dn=${encodeURIComponent(mg.name)}${TR_TRACKERS}`, '--out', dir, '--keep-seeding'], { stdio: ['ignore', 'ignore', 'ignore'] });
+        wt.on('error', () => {});
+        trActiveProc = wt;
+        const deadline = Date.now() + 180000;
+        let lastSz = -1, stall = 0;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 3000));
+            const files = (() => { try { return fs.readdirSync(dir); } catch (_) { return []; } })();
+            let big = null, bigSz = 0;
+            for (const f of files) {
+                try {
+                    const st = fs.statSync(path.join(dir, f));
+                    if (st.isFile() && st.size > bigSz && /\.(mp4|mkv|avi)$/i.test(f)) { big = path.join(dir, f); bigSz = st.size; }
+                } catch (_) {}
+            }
+            if (big && bigSz >= 20 * 1024 * 1024) {
+                console.log(`[TR] ready early: ${big} (${Math.round(bigSz / 1048576)}MB downloaded)`);
+                return { title, year: '', sources: [{ url: big, quality: mg.quality === '2160p' ? '4K' : '720', server: 'Torrent-' + mg.quality }], subUrl: null };
+            }
+            if (bigSz > 0 && bigSz === lastSz) { if (++stall >= 12) break; } else { stall = 0; lastSz = bigSz; }
+        }
+        console.log('[TR] download stalled/timeout');
+        try { wt.kill('SIGKILL'); } catch (_) {}
+        if (trActiveProc === wt) trActiveProc = null;
+        return null;
+    } catch (e) { console.error('[TR] error:', e.message); return null; }
+}
+
+function trArabicSrt(tmdbId) {
+    try {
+        const dir = TR_DIR_PREFIX + tmdbId;
+        const files = fs.readdirSync(dir).filter(f => /\.srt$/i.test(f));
+        if (!files.length) return null;
+        const pick = files.find(f => /arab|ara\.|\.ar\.|-ar_|^ar[\._]/i.test(f))
+            || files.find(f => /\barabic\b/i.test(f))
+            || null;
+        if (!pick) return null;
+        const dst = `/tmp/vlsub_tr_${tmdbId}_${Date.now()}.srt`;
+        fs.copyFileSync(path.join(dir, pick), dst);
+        console.log(`[TR] embedded arabic sub found: ${pick}`);
+        return dst;
+    } catch (_) { return null; }
+}
+const OPENSUB_API_KEY = readEnvKey('OPENSUB_API_KEY');
+async function osArabicSub(type, tmdbId, s, e) {
+    try {
+        if (!OPENSUB_API_KEY) return null;
+        const qs = new URLSearchParams({ tmdb_id: String(tmdbId), languages: 'ar' });
+        if (type === 'tv') { qs.set('type', 'episode'); if (s) qs.set('season_number', String(s)); if (e) qs.set('episode_number', String(e)); }
+        else qs.set('type', 'movie');
+        const r1 = await fetch(`https://api.opensubtitles.com/api/v1/subtitles?${qs}`, { headers: { 'Api-Key': OPENSUB_API_KEY, 'User-Agent': 'iptv-bot v1' }, signal: AbortSignal.timeout(15000) });
+        const j1 = await r1.json();
+        const fid = j1 && j1.data && j1.data[0] && j1.data[0].attributes && j1.data[0].attributes.files && j1.data[0].attributes.files[0] && j1.data[0].attributes.files[0].file_id;
+        if (!fid) { console.log('[OS] no arabic subtitle found'); return null; }
+        const r2 = await fetch('https://api.opensubtitles.com/api/v1/download', { method: 'POST', headers: { 'Api-Key': OPENSUB_API_KEY, 'User-Agent': 'iptv-bot v1', 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ file_id: fid }), signal: AbortSignal.timeout(15000) });
+        const j2 = await r2.json();
+        const link = j2 && j2.link;
+        if (!link) { console.log('[OS] download link denied (quota?)'); return null; }
+        const r3 = await fetch(link, { signal: AbortSignal.timeout(20000) });
+        const buf = Buffer.from(await r3.arrayBuffer());
+        let text = buf.toString('utf8');
+        if (/\ufffd{2,}/.test(text.slice(0, 4000))) text = buf.toString('latin1').replace(/[^\x00-\xFF\u0600-\u06FF\s\S]/g, '');
+        if (/^\s*\d+\s*$/m.test(text) && /\u0600-\u06FF|-->/.test(text)) {
+            const dst = `/tmp/vlsub_os_${tmdbId}_${Date.now()}.srt`;
+            fs.writeFileSync(dst, text, 'utf8');
+            console.log(`[OS] arabic subtitle saved (${Math.round(buf.length / 1024)}KB)`);
+            return dst;
+        }
+        return null;
+    } catch (e) { console.error('[OS] error:', e.message); return null; }
+}
+
+async function vdArabicSub(type, id, s, e) {
+    try {
+        const u = type === 'tv'
+            ? `https://sub.vdrk.site/v2/tv/${id}/${s || 1}/${e || 1}`
+            : `https://sub.vdrk.site/v2/movie/${id}`;
+        const arr = JSON.parse(await ccFetch(u));
+        if (Array.isArray(arr)) {
+            const ok = arr.filter(x => x && (x.file || x.url));
+            const ar = ok.find(x => /arabic/i.test(x.label || x.language || '')) ||
+                       ok.find(x => /^ar(\b|_|$)/i.test(String(x.language || '')));
+            if (ar) return ar.file || ar.url;
+        }
+    } catch (_) {}
+    const directs = type === 'tv'
+        ? [`https://cache.vdrk.site/v3/tv/${id}/${s || 1}/${e || 1}/Arabic.vtt`, `https://cache.vdrk.site/v1/vtt/tv/${id}/${s || 1}/${e || 1}/Arabic.vtt`]
+        : [`https://cache.vdrk.site/v3/movie/${id}/Arabic.vtt`, `https://cache.vdrk.site/v1/vtt/movie/${id}/Arabic.vtt`];
+    for (const du of directs) {
+        try {
+            const t = await ccFetch(du);
+            if (t && t.includes('-->') && t.length > 500) return du;
+        } catch (_) {}
+    }
+    return null;
+}
+
+const providerHealth = {};
+const PH_FILE = '/tmp/provider_health.json';
+function phLoad() { try { Object.assign(providerHealth, JSON.parse(fs.readFileSync(PH_FILE, 'utf8'))); } catch (_) {} }
+function phSave() { try { fs.writeFileSync(PH_FILE, JSON.stringify(providerHealth)); } catch (_) {} }
+function phVal(p) {
+    const h = providerHealth[p];
+    if (h && Date.now() - h.t > 15 * 60000) { delete providerHealth[p]; return 0; }
+    return h ? h.n : 0;
+}
+function phBump(p) { const h = providerHealth[p] || (providerHealth[p] = { n: 0 }); h.n++; h.t = Date.now(); phSave(); }
+function phReset(p) { delete providerHealth[p]; phSave(); }
+const PH_SKIP = 4;
+
+async function probePlayable(src) {
+    try {
+        const u = (src && src.url) || '';
+        if (!/^https?:\/\//i.test(u)) return true;
+        const hdrs = Object.assign({}, src.headers || {});
+        if (!hdrs['user-agent']) hdrs['user-agent'] = CC_UA;
+        hdrs.range = 'bytes=0-1023';
+        const r = await fetch(u, { headers: hdrs, signal: AbortSignal.timeout(6000), redirect: 'follow' });
+        return r.ok || r.status === 206;
+    } catch (_) { return false; }
+}
+async function pickAcrossProviders(type, id, s, e) {
+    const fns = {
+        VL: () => vlSources(type, id),
+        VK: () => vkSources(type, id, s, e),
+        CC: () => ccSources(type, id),
+        MG: () => mgSources(type, id, s, e),
+        ST: () => stSources(type, id),
+    };
+    const healthy = ['VL', 'VK', 'CC', 'MG', 'ST'].filter(p => phVal(p) < PH_SKIP);
+    console.log(`[RACE] asking ${healthy.join('+')} in parallel...`);
+    const settled = await Promise.all(healthy.map(async (p) => {
+        try { return { p, res: await fns[p]() }; } catch (_) { return { p, res: null }; }
+    }));
+    for (const p of healthy) {
+        const hit = settled.find(x => x.p === p);
+        const res = hit && hit.res;
+        if (!res || !res.sources || !res.sources.length) continue;
+        const ranked = vkPickBest(res.sources, '720', true) || [];
+        for (const cand of ranked.slice(0, 3)) {
+            console.log(`[RACE] probing ${p} ${cand.quality || ''} ${cand.server || ''}...`);
+            if (await probePlayable(cand)) return { provider: p, res, best: cand };
+            console.log(`[RACE] ${p} source failed probe -> next candidate`);
+        }
+        phBump(p);
+    }
+    return null;
+}
+
+async function pickAlive(cands) {
+    if (!cands || !cands.length) return null;
+    const objs = cands.map(c => typeof c === 'string' ? { url: c, quality: 'auto' } : c);
+    const ranked = vkPickBest(objs, '720', true);
+    for (const c of ranked.slice(0, 3)) {
+        if (!/^https?:\/\//i.test(c.url || '')) return [c];
+        if (await probePlayable(c)) return [c];
+        console.log(`[ROTATE] candidate failed probe (${c.server || c.quality || '?'}) -> next`);
+    }
+    return null;
+}
+function makeCrossRefresh(type, id, s, e, state) {
+    return async (mode) => {
+        if (mode === 'seek') state.fastFails = 0;
+        else if (mode === 'fast') state.fastFails = (state.fastFails || 0) + 1;
+        else if (mode === 'slow') state.fastFails = 0;
+        const burned = (state.fastFails || 0) >= 2;
+
+        if (state.provider === 'VL') {
+            let picked = null;
+            const vlDead = phVal('VL') >= PH_SKIP;
+            if (!burned && !vlDead) {
+                try {
+                    const r2 = await vlSources(type, id, s, e);
+                    if (r2 && r2.sources.length) {
+                        picked = await pickAlive(r2.sources);
+                        if (picked) console.log(`[VL] refresh -> ${picked[0].quality} (probe ok)`);
+                    }
+                } catch (_) {}
+            }
+            if (picked) { phReset('VL'); return picked; }
+            if (burned) { if (vlDead) console.log('[ROTATE] VL still dead -> skipping'); else phBump('VL'); }
+            console.log(burned ? '[ROTATE] VL dying instantly x3 -> switching to VK' : '[ROTATE] VL failed -> switching to VK');
             state.provider = 'VK';
+            state.fastFails = 0;
         }
         if (state.provider === 'VK') {
+            let picked = null;
+            const vkDead = phVal('VK') >= PH_SKIP;
+            if (!burned && !vkDead) {
+                try {
+                    const r3 = await vkSources(type, id, s, e);
+                    if (r3 && r3.sources.length) {
+                        picked = await pickAlive(r3.sources);
+                        if (picked) console.log(`[VK] refresh -> ${picked[0].server} ${picked[0].quality} (probe ok)`);
+                    }
+                } catch (_) {}
+            }
+            if (picked) { phReset('VK'); return picked; }
+            if (burned) { if (vkDead) console.log('[ROTATE] VK still dead -> skipping'); else phBump('VK'); }
+            console.log(burned ? '[ROTATE] VK dying instantly x3 -> switching to 2Embed' : '[ROTATE] VK failed -> switching to 2Embed');
+            state.provider = 'CC';
+            state.fastFails = 0;
+        }
+        let ccPick = null;
+        if (state.provider === 'CC' && !burned && phVal('CC') < PH_SKIP) {
             try {
-                const r3 = await vkSources(type, id, s, e);
-                if (r3 && r3.sources.length) {
-                    const pick = r3.sources[state.idx % r3.sources.length];
-                    state.idx++;
-                    state.cycleFails = 0;
-                    console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
-                    return [pick.url];
+                const r4 = await ccSources(type, id, s, e);
+                if (r4 && r4.sources.length) {
+                    ccPick = await pickAlive(r4.sources);
+                    if (ccPick) console.log(`[CC] refresh -> ${ccPick[0].server} (probe ok)`);
                 }
             } catch (_) {}
-            console.log('[ROTATE] VK failed -> switching to 2Embed');
-            state.provider = 'CC';
         }
+        if (ccPick) { phReset('CC'); return ccPick; }
+        if (state.provider === 'CC' && burned) phBump('CC');
+        console.log(burned ? '[ROTATE] 2Embed dying instantly x3 -> switching to MegaEmbed' : '[ROTATE] 2Embed failed -> switching to MegaEmbed');
+        state.provider = 'MG';
+        state.fastFails = 0;
+        state.mgTries = 0;
+        let mgPick = null;
+        if (!burned && phVal('MG') < PH_SKIP) {
+            try {
+                const rm = await mgSources(type, id, s, e);
+                if (rm && rm.sources.length) {
+                    if ((state.mgTries || 0) >= rm.sources.length + 1) {
+                        console.log('[ROTATE] MegaEmbed sources exhausted -> switching to 111movies');
+                        phBump('MG');
+                    } else {
+                        const pick = rm.sources[state.idx % rm.sources.length];
+                        state.idx++;
+                        state.mgTries++;
+                        console.log(`[MG] refresh -> ${pick.server}`);
+                        mgPick = await pickAlive([pick]);
+                    }
+                }
+            } catch (_) {}
+        }
+        if (mgPick) { phReset('MG'); state.cycleFails = 0; state.mgTries = 0; return mgPick; }
+        if (burned) phBump('MG');
+        console.log('[ROTATE] MegaEmbed failed -> switching to 111movies');
+        state.provider = 'ST';
+        state.fastFails = 0;
         try {
-            const r4 = await ccSources(type, id, s, e);
-            if (r4 && r4.sources.length) {
-                const pick = r4.sources[state.idx % r4.sources.length];
-                state.idx++;
-                state.cycleFails = 0;
-                console.log(`[CC] refresh -> ${pick.server}`);
-                return [pick];
+            const r5 = await stSources(type, id, s, e);
+            if (r5 && r5.sources.length) {
+                const stPick = await pickAlive(r5.sources);
+                if (stPick) {
+                    state.cycleFails = 0;
+                    phReset('ST');
+                    console.log('[ST] refresh -> 111movies (probe ok)');
+                    return stPick;
+                }
             }
         } catch (_) {}
+        if (burned) phBump('ST');
         state.cycleFails = (state.cycleFails || 0) + 1;
-        if (state.provider === 'CC' && state.cycleFails < 6) {
-            console.log('[ROTATE] 2Embed failed -> back to VL for fresh urls');
+        if (state.provider === 'ST' && state.cycleFails < 8) {
+            console.log('[ROTATE] 111movies failed -> back to VL for fresh urls');
             state.provider = 'VL';
         }
         return null;
@@ -848,6 +1243,81 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
     mediaInfo = { title: title || currentChannelName || 'media', live: false, offsetBase: 0, runStartedAt: Date.now(), paused: false, pauseStartedAt: null };
     const { width, height, fps, bitrate, maxrate, bufsize } = quality;
 
+    let subBaseBuf = null;
+    if (subsPath) { try { subBaseBuf = fs.readFileSync(subsPath); } catch (_) {} }
+    let rescueCount = 0;
+    const RESCUE_MAX = 4;
+    const shiftSrt = (off) => {
+        if (!subBaseBuf || !(off > 0)) return subsPath;
+        const fmt = (t) => {
+            let ms = Math.round(t * 1000);
+            if (ms < 0) ms = 0;
+            const hh = Math.floor(ms / 3600000); ms -= hh * 3600000;
+            const mm = Math.floor(ms / 60000); ms -= mm * 60000;
+            const ss = Math.floor(ms / 1000); ms -= ss * 1000;
+            return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+        };
+        const lines = subBaseBuf.toString('utf8').split('\n');
+        const out = [];
+        for (let i = 0; i < lines.length; i++) {
+            const l = lines[i];
+            const m = l.match(/^\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/);
+            if (!m) { out.push(l); continue; }
+            const frac = (g) => { const v = String(m[g] || ''); return (+v || 0) / Math.pow(10, v.length || 1); };
+            const st = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + frac(4);
+            const en = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + frac(8);
+            if (en - off <= 0.05) {
+                while (i + 1 < lines.length && lines[i + 1].trim() !== '' && !lines[i + 1].includes('-->')) i++;
+                continue;
+            }
+            out.push(`${fmt(st - off)} --> ${fmt(en - off)}`);
+        }
+        const p2 = subsPath.replace(/\.srt$/i, '') + `_sh${Math.floor(off)}s.srt`;
+        try { fs.writeFileSync(p2, out.join('\n')); console.log(`[SUBS] shifted by ${Math.floor(off)}s -> ${p2}`); return p2; }
+        catch (_) { return subsPath; }
+    };
+
+    let placeholderProc = null;
+    const stopPlaceholder = () => {
+        if (placeholderProc) { try { placeholderProc.kill('SIGKILL'); } catch (_) {} }
+        placeholderProc = null;
+    };
+    const startPlaceholder = () => {
+        if (!isPlaying || placeholderProc) return;
+        if (!fs.existsSync('/tmp/loading.png')) return;
+        try { streamer.stopStream(); } catch (_) {}
+        try {
+            placeholderProc = spawn(ffmpegPath, [
+                '-hide_banner', '-loglevel', 'error',
+                '-loop', '1', '-framerate', String(Math.min(fps, 15)), '-i', '/tmp/loading.png',
+                '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+                '-shortest',
+                '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+                '-profile:v', 'main', '-level', '4.1',
+                '-c:a', 'libopus', '-b:a', '128k', '-ac', '2', '-ar', '48000',
+                '-s', `${width}x${height}`, '-r', String(fps),
+                '-b:v', '1200k', '-maxrate', '1500k', '-bufsize', '2400k',
+                '-pix_fmt', 'yuv420p', '-g', '60',
+                '-f', 'mpegts', 'pipe:1',
+            ], { stdio: ['pipe', 'pipe', 'pipe'] });
+            placeholderProc.on('exit', () => { placeholderProc = null; });
+            const pbuf = new PassThrough({ highWaterMark: 512 * 1024 });
+            pbuf.on('error', () => {});
+            placeholderProc.stdout.pipe(pbuf);
+            playStream(pbuf, streamer, {
+                type: 'go-live',
+                format: 'mpegts',
+                width: width,
+                height: height,
+                frameRate: fps,
+            }).catch(() => {});
+            console.log('[LOAD] loading screen on air');
+        } catch (e) {
+            console.error('[LOAD] placeholder failed:', e.message);
+            placeholderProc = null;
+        }
+    };
+
     while (reconnectAttempts < MAX_RECONNECT) {
         if (!isPlaying) break;
 
@@ -855,7 +1325,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
 
             try {
                 await joinVoiceSafe();
-                try { streamer.stopStream(); } catch (_) {}
+                if (!placeholderProc) { try { streamer.stopStream(); } catch (_) {} }
                 if (activePlayPromise) {
                     await Promise.race([activePlayPromise.catch(() => {}), sleep(4000)]);
                     activePlayPromise = null;
@@ -870,7 +1340,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
             await new Promise((resolve, reject) => {
                 const mkInput = (u, hdrs, extPicky) => [
                     ...(extPicky ? ['-extension_picky', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'] : []),
-                    ...(hdrs && hdrs.referer ? ['-headers', Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n'] : []),
+                    ...(hdrs && Object.keys(hdrs).length ? ['-headers', Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n'] : []),
                     ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
                     ...(/^https?:\/\//i.test(u) ? ['-re', '-readrate', '1.05'] : []),
                     '-reconnect', '1',
@@ -886,30 +1356,31 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 const inputArgs = audioUrl
                     ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky), ...mkInput(audioUrl)]
                     : mkInput(videoUrl, curSrc.headers, curSrc.extPicky);
-                const subSize = Math.min(30, Math.max(16, Math.round(quality.height * 0.035)));
-                const subMarginV = Math.round(quality.height * 0.055);
                 const subStyle = [
-                    'FontName=Noto Naskh Arabic',
-                    `FontSize=${subSize}`,
-                    'Bold=0',
+                    'FontName=Noto Sans Arabic',
+                    'FontSize=24',
+                    'Bold=1',
                     'PrimaryColour=&H00FFFFFF',
                     'OutlineColour=&H00000000',
                     'BackColour=&HA0000000',
                     'BorderStyle=1',
-                    'Outline=1.4',
-                    'Shadow=0.6',
-                    'Spacing=0.3',
+                    'Outline=2',
+                    'Shadow=1',
+                    'Spacing=0',
                     'Alignment=2',
-                    `MarginV=${subMarginV}`,
+                    'MarginV=25',
                 ].join(',');
+                const burnSubs = seekOffset > 0 ? shiftSrt(seekOffset) : subsPath;
                 const args = [
                     '-hide_banner', '-loglevel', 'warning',
                     ...inputArgs,
-                    ...(subsPath ? ['-vf', `subtitles=${subsPath}:force_style='${subStyle}'`] : []),
+                    ...(burnSubs
+                        ? ['-vf', `scale=${width}:${height},format=yuv420p,subtitles=${burnSubs}:fontsdir=/home/master/.local/share/fonts:charenc=UTF-8:force_style='${subStyle}'`]
+                        : ['-vf', `scale=${width}:${height},format=yuv420p`]),
                     '-fflags', '+genpts+discardcorrupt+nobuffer',
                     '-flags', '+low_delay+global_header',
                     '-max_muxing_queue_size', '4096',
-                    ...(audioUrl ? ['-map', '0:v:0', '-map', '1:a:0', '-shortest'] : []),
+                    ...(audioUrl ? ['-map', '0:v:0', '-map', '1:a:0', '-shortest'] : ['-map', '0:v:0', '-map', '0:a:0?']),
                     '-c:v', 'libx264',
                     '-preset', 'veryfast',
                     '-tune', 'zerolatency',
@@ -964,6 +1435,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 mediaBufferStream = bufferStream;
                 if (mediaInfo) { mediaInfo.offsetBase = seekOffset; mediaInfo.runStartedAt = Date.now(); }
 
+                stopPlaceholder();
+                try { streamer.stopStream(); } catch (_) {}
                 activePlayPromise = playStream(bufferStream, streamer, {
                     type: 'go-live',
                     format: 'mpegts',
@@ -973,11 +1446,13 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 }).then(() => resolve()).catch(reject);
             });
         } catch (err) {
-            console.error(`[YT] Error: ${String((err && err.message) || err)}`);
+            const st = err && err.stack ? String(err.stack).split('\n').slice(1, 9).join(' | ') : '';
+            console.error(`[YT] Error: ${String((err && err.message) || err)}${st ? '\n[STACK] ' + st : ''}`);
         }
 
         killFFmpeg();
         if (!isPlaying) break;
+        startPlaceholder();
 
         if (pendingSeek !== null) {
             seekOffset = Math.max(0, Math.floor(pendingSeek));
@@ -994,24 +1469,25 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
         }
 
         const ranMs = Date.now() - (mediaInfo ? mediaInfo.runStartedAt : Date.now());
-        if (seekOffset > 0 && ranMs < 8000 && seekFails < 3) {
+        if (seekOffset > 0 && ranMs < 8000 && seekFails < 8) {
             seekFails++;
-            console.log(`[YT] Seeked run died fast (${Math.round(ranMs / 1000)}s), retry ${seekFails}/3 with fresh URL`);
+            console.log(`[YT] Seeked run died fast (${Math.round(ranMs / 1000)}s), retry ${seekFails}/8 with fresh URL`);
             if (refresher) {
                 try {
-                    const nu = await refresher();
+                    const nu = await refresher('seek');
                     if (nu && nu[0]) { curSrc = asSrc(nu[0]); urlList[0] = curSrc; videoUrl = curSrc.url; audioUrl = nu[1] ? asSrc(nu[1]).url : null; }
                 } catch (_) {}
             }
             reconnectAttempts = 0;
-            await sleep(10000);
+            startPlaceholder();
+            await sleep(4000);
             continue;
         }
         if (ranMs >= 30000) seekFails = 0;
 
         if (refresher && reconnectAttempts > 0) {
             try {
-                const nu = await refresher();
+                const nu = await refresher(ranMs < 8000 ? 'fast' : 'slow');
                 if (nu && nu[0]) {
                     curSrc = asSrc(nu[0]);
                     urlList[0] = curSrc;
@@ -1034,8 +1510,26 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
         }
 
         reconnectAttempts++;
-        if (reconnectAttempts < MAX_RECONNECT) {
-            await sleep(RECONNECT_DELAY);
+        if (reconnectAttempts >= MAX_RECONNECT) {
+            if (rescueCount < RESCUE_MAX && isPlaying) {
+                rescueCount++;
+                reconnectAttempts = 0;
+                seekFails = 0;
+                console.log(`[YT] retries exhausted -> rescue ${rescueCount}/${RESCUE_MAX}, reloading sources`);
+                try { reply(message, `🔄 المصدر ضعيف شوية — جاري إعادة تحميل البث تلقائيًا (${rescueCount}/${RESCUE_MAX})...`); } catch (_) {}
+                if (refresher) {
+                    try {
+                        const nu = await refresher('slow');
+                        if (nu && nu[0]) { curSrc = asSrc(nu[0]); urlList[0] = curSrc; videoUrl = curSrc.url; audioUrl = nu[1] ? asSrc(nu[1]).url : null; }
+                    } catch (_) {}
+                }
+                startPlaceholder();
+                await sleep(15000);
+                continue;
+            }
+        } else {
+            if (ranMs >= 8000) startPlaceholder();
+            await sleep(ranMs < 8000 ? 1200 : RECONNECT_DELAY);
         }
     }
 
@@ -1044,7 +1538,9 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
     mediaBufferStream = null;
     isPaused = false;
     mediaInfo = null;
+    console.log('[YT] giving up after max retries/rescues');
     killFFmpeg();
+    stopPlaceholder();
     try { streamer.stopStream(); } catch (_) {}
     try { streamer.leaveVoice(); } catch (_) {}
     return reconnectAttempts >= MAX_RECONNECT ? 'failed' : 'ended';
@@ -1052,8 +1548,28 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
 
 client.on('ready', async () => {
     console.log(`Logged in as: ${client.user.tag}`);
+    try { await streamModReady; } catch (e) { console.error('[MOD] stream lib unavailable:', e.message); }
+    if (Streamer && !streamer) streamer = new Streamer(client);
     console.log(`FFmpeg path: ${ffmpegPath || 'NOT FOUND'}`);
+    phLoad();
+    trKill();
     await fetchChannels();
+    const cleanOldSubs = () => {
+        try {
+            const old = fs.readdirSync('/tmp').filter(f => /^vlsub_.*\.srt$/.test(f) && Date.now() - fs.statSync('/tmp/' + f).mtimeMs > 24 * 3600e3);
+            old.forEach(f => { try { fs.unlinkSync('/tmp/' + f); } catch (_) {} });
+            if (old.length) console.log(`[CLEAN] removed ${old.length} old subtitle files`);
+        } catch (_) {}
+    };
+    cleanOldSubs();
+    setInterval(cleanOldSubs, 60 * 60e3);
+    (async () => {
+        try {
+            fs.writeFileSync('/tmp/loading.srt', '1\n00:00:00,000 --> 00:01:00,000\nجاري التحميل…\n');
+            await execAsync(`/usr/bin/ffmpeg -y -loglevel error -f lavfi -i color=c=0x14141e:s=1280x720:d=1 -vf "subtitles=/tmp/loading.srt:fontsdir=/home/master/.local/share/fonts:charenc=UTF-8:force_style='FontName=Noto Sans Arabic,FontSize=30,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.2,Shadow=0.8,Spacing=0,Alignment=5'" -frames:v 1 /tmp/loading.png`);
+            console.log('[LOAD] loading screen ready');
+        } catch (e) { console.error('[LOAD] png failed:', e.message); }
+    })();
 });
 
 client.on('messageCreate', async (message) => {
@@ -1254,36 +1770,41 @@ client.on('messageCreate', async (message) => {
 
         // ===== Vidking playback commands =====
         if (message.content.startsWith('!playmovie ') || message.content.startsWith('!بثفيلم ')) {
-            const id = message.content.split(' ')[1];
-            if (!id || !/^\d+$/.test(id)) return reply(message, '❌ الاستخدام: `!playmovie <id>` — جيب الـ ID من `!movie <اسم>`');
+            const rawArgs = message.content.split(' ').slice(1).join(' ').trim();
+            if (!rawArgs) return reply(message, '❌ الاستخدام:\n`!playmovie joker` بالاسم\n`!playmovie 475557` بالـID');
+            let id = rawArgs;
+            let preTitle = '';
+            if (!/^\d+$/.test(rawArgs)) {
+                await reply(message, `🔎 جاري البحث عن **${rawArgs}**...`);
+                const results = await tmdbSearch('movie', rawArgs);
+                if (!results.length) return reply(message, `❌ ملقتش فيلم باسم **${rawArgs}**`);
+                id = String(results[0].id);
+                preTitle = results[0].title || results[0].name || '';
+                console.log(`[MOVIE] "${rawArgs}" -> tmdb ${id} (${preTitle})`);
+            }
             if (isPlaying) return reply(message, '❌ يوجد بث قيد التشغيل. استعمل `!stop` أولاً.');
             await reply(message, '🔍 جاري استخراج البث...');
             try {
                 let res = null, best = null, provider = 'VL';
-                try {
-                    res = await vlSources('movie', id);
-                    best = res && vkPickBest(res.sources, '720');
-                } catch (e) { console.error('[VL] movie sources error:', e.message); res = null; }
+                const got = await pickAcrossProviders('movie', id);
+                if (got) { provider = got.provider; res = got.res; best = got.best; }
+                if (best && !res.title) res = { ...res, title: preTitle || 'الفيلم' };
                 if (!best) {
-                    provider = 'VK';
-                    try {
-                        res = await vkSources('movie', id, 1, 1);
-                        best = vkPickBest(res.sources, '720');
-                    } catch (e) { console.error('[VK] movie sources error:', e.message); res = null; }
+                    await reply(message, '🧲 مفيش مصادر مباشرة — جاري تحميل نسخة تورنت (قد تأخذ دقيقة)...');
+                    const tr = await trSources('movie', id);
+                    if (!tr || !tr.sources.length) return reply(message, `❌ مفيش مصادر متاحة لـ **${preTitle || rawArgs}** حالياً. جرّب بعدين.`);
+                    provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
-                if (!best) {
-                    provider = 'CC';
-                    try {
-                        res = await ccSources('movie', id);
-                        best = res && vkPickBest(res.sources, '720');
-                    } catch (e) { console.error('[CC] movie sources error:', e.message); res = null; }
-                }
-                if (best && !res.title) res = { ...res, title: 'الفيلم' };
-                if (!best) return reply(message, '❌ مفيش مصادر متاحة للفيلم ده حالياً. جرّب بعدين.');
                 let subPath = null;
-                if (provider === 'VL' && res.subUrl) {
+                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPath = await vlFetchArabicSub(res.subUrl);
                 }
+                if (!subPath) {
+                    const alt = await vdArabicSub('movie', id);
+                    if (alt) subPath = await vlFetchArabicSub(alt);
+                }
+                if (!subPath) subPath = trArabicSrt(id);
+                if (!subPath) subPath = await osArabicSub('movie', id);
                 isPlaying = true;
                 currentChannelName = res.title;
                 await reply(message, `🎬 جاري بث **${res.title}** في الروم...${subPath ? ' 📝 بالترجمة العربية' : ''}`);
@@ -1301,40 +1822,66 @@ client.on('messageCreate', async (message) => {
             }
         }
 
+        if (message.content === '!next' && lastSeriesCtx) {
+            const nx = { ...lastSeriesCtx, e: lastSeriesCtx.e + 1 };
+            if (isPlaying || placeholderProc) {
+                trKill();
+                await stopPlaying(message);
+                await new Promise(r => setTimeout(r, 1200));
+            }
+            await reply(message, `⏭️ تشغيل الحلقة التالية — S${nx.s}E${nx.e}...`);
+            message.content = `!playseries ${nx.id} ${nx.s} ${nx.e}`;
+        }
+
         if (message.content.startsWith('!playseries ') || message.content.startsWith('!بثمسلسل ')) {
-            const parts = message.content.split(' ').slice(1);
-            if (!parts[0] || !/^\d+$/.test(parts[0])) return reply(message, '❌ الاستخدام:\n`!playseries <id>` موسم 1 حلقة 1\n`!playseries <id> 2 5` موسم وحلقة محددة');
+            const rawParts = message.content.split(' ').slice(1);
+            if (!rawParts.length) return reply(message, '❌ الاستخدام:\n`!playseries ted lasso` موسم 1 حلقة 1\n`!playseries ted lasso 2 5`\n`!playseries 97546 2 5` بالـID');
+            let s = parseInt(rawParts[1], 10) || 1;
+            let e = parseInt(rawParts[2], 10) || 1;
+            let idStr = rawParts.join(' ');
+            let preTitle = '';
+            if (!/^\d+$/.test(rawParts[0])) {
+                const toks = [...rawParts];
+                const tailNums = [];
+                while (tailNums.length < 2 && toks.length > 1 && /^\d+$/.test(toks[toks.length - 1])) {
+                    tailNums.unshift(toks.pop());
+                }
+                const q = toks.join(' ');
+                await reply(message, `🔎 جاري البحث عن **${q}**...`);
+                const results = await tmdbSearch('tv', q);
+                if (!results.length) return reply(message, `❌ ملقتش مسلسل باسم **${q}**`);
+                idStr = String(results[0].id);
+                preTitle = results[0].title || results[0].name || '';
+                if (tailNums.length >= 1) s = tailNums[0];
+                if (tailNums.length >= 2) e = tailNums[1];
+                console.log(`[SERIES] "${q}" -> tmdb ${idStr} (${preTitle}) S${s}E${e}`);
+            }
+            const parts = [idStr];
             if (isPlaying) return reply(message, '❌ يوجد بث قيد التشغيل. استعمل `!stop` أولاً.');
-            const s = parseInt(parts[1], 10) || 1;
-            const e = parseInt(parts[2], 10) || 1;
             await reply(message, '🔍 جاري استخراج البث...');
             try {
                 let res = null, best = null, provider = 'VL';
-                try {
-                    res = await vlSources('tv', parts[0], s, e);
-                    best = res && vkPickBest(res.sources, '720');
-                } catch (e) { console.error('[VL] tv sources error:', e.message); res = null; }
+                const gotTv = await pickAcrossProviders('tv', parts[0], s, e);
+                if (gotTv) { provider = gotTv.provider; res = gotTv.res; best = gotTv.best; }
+                if (best && !res.title) res = { ...res, title: preTitle || 'المسلسل' };
                 if (!best) {
-                    provider = 'VK';
-                    try {
-                        res = await vkSources('tv', parts[0], s, e);
-                        best = vkPickBest(res.sources, '720');
-                    } catch (e) { console.error('[VK] tv sources error:', e.message); res = null; }
+                    await reply(message, '🧲 مفيش مصادر مباشرة — جاري تحميل نسخة تورنت للحلقة (قد تأخذ دقيقة)...');
+                    const tr = await trSources('tv', parts[0], s, e);
+                    if (!tr || !tr.sources.length) return reply(message, '❌ مفيش مصادر متاحة للحلقة دي حالياً. جرّب بعدين.');
+                    provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
-                if (!best) {
-                    provider = 'CC';
-                    try {
-                        res = await ccSources('tv', parts[0], s, e);
-                        best = res && vkPickBest(res.sources, '720');
-                    } catch (e) { console.error('[CC] tv sources error:', e.message); res = null; }
-                }
-                if (best && !res.title) res = { ...res, title: 'المسلسل' };
-                if (!best) return reply(message, '❌ مفيش مصادر متاحة للحلقة دي حالياً. جرّب بعدين.');
                 let subPathTv = null;
-                if (provider === 'VL' && res.subUrl) {
+                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPathTv = await vlFetchArabicSub(res.subUrl);
                 }
+                if (!subPathTv) {
+                    const alt = await vdArabicSub('tv', parts[0], s, e);
+                    if (alt) subPathTv = await vlFetchArabicSub(alt);
+                }
+                if (!subPathTv && provider === 'TR') subPathTv = trArabicSrt(parts[0]);
+                if (!subPathTv) subPathTv = await osArabicSub('tv', parts[0], s, e);
                 isPlaying = true;
+                lastSeriesCtx = { id: parts[0], s, e };
                 currentChannelName = res.title;
                 await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...${subPathTv ? ' 📝 بالترجمة العربية' : ''}`);
                 console.log(`[${provider}] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}${subPathTv ? ' +subs' : ''}`);
@@ -1445,7 +1992,16 @@ client.on('messageCreate', async (message) => {
             await reply(message, msg);
         }
 
+        if (message.content === '!status' || message.content === '!حالة') {
+            const bar = (v) => v >= PH_SKIP ? '⛔' : v === 0 ? '✅' : '🟡';
+            const provs = ['VL', 'VK', 'CC', 'MG', 'ST'].map(p => `${bar(phVal(p))} ${p} — ${phVal(p) >= PH_SKIP ? 'متخطى مؤقتًا' : phVal(p) + ' أخطاء'}`).join('\n');
+            const trLine = trActiveProc ? '⬇️ جاري تنزيل تورنت...' : '🧲 جاهز كاحتياطي';
+            const playLine = isPlaying ? `▶️ ${currentChannelName || 'قناة'}${mediaInfo && !mediaInfo.live ? ` @ ${fmtDur(playbackPos() || 0)}` : ''}` : '⏹️ لا يوجد بث';
+            await reply(message, `📊 **حالة النظام**\n\n**المزودون:**\n${provs}\n\n**البث:** ${playLine}\n**التورنت:** ${trLine}\n**الترجمة:** ${OPENSUB_API_KEY ? 'OpenSubtitles ✓' : 'vdrk فقط'}\n**الحلقة التالية:** ${lastSeriesCtx ? `S${lastSeriesCtx.s}E${lastSeriesCtx.e} جاهزة لـ!next` : '—'}`);
+        }
+
         if (message.content === '!stop') {
+            trKill();
             await stopPlaying(message);
         }
 
@@ -1551,7 +2107,7 @@ client.on('messageCreate', async (message) => {
                 '**عام:**',
                 '`!stop` - إيقاف البث',
                 '`!quality <جودة>` - ضبط جودة IPTV',
-                '`!status` - حالة البث',
+                '`!status` / `!حالة` - تقرير شامل: صحة المزودين + البث + التورنت',
                 '`!id` / `!id <رقم>` - ROM الصوتي',
                 '`!guildid` / `!guildid <رقم>` - السيرفر',
                 '`!txt` - تصدير القنوات',
@@ -1570,8 +2126,12 @@ client.on('messageCreate', async (message) => {
                 '`!movie <id>` - تفاصيل + لينك مشاهدة',
                 '`!series <اسم>` - بحث عن مسلسل',
                 '`!series <id> <موسم> <حلقة>` - مشاهدة حلقة',
-                '`!playmovie <id>` - بث الفيلم في الروم الصوتي',
-                '`!playseries <id> [موسم] [حلقة]` - بث الحلقة في الروم',
+                '`!playmovie <اسم أو id>` - بث الفيلم في الروم الصوتي',
+                '`!playseries <اسم أو id> [موسم] [حلقة]` - بث الحلقة في الروم',
+                '`!next` - تشغيل الحلقة التالية فورًا',
+                '',
+                '📝 كل الأفلام والمسلسلات بتت بث **بالترجمة العربية تلقائيًا**',
+                '🧲 لو المصادر المباشرة فشلت → تحميل تورنت تلقائي (أوعبة أمان)',
                 '',
                 '⏯️ **التحكم في التشغيل:**',
                 '`!pause` - إيقاف مؤقت | `!resume` - استكمال',
@@ -1580,14 +2140,6 @@ client.on('messageCreate', async (message) => {
                 '`!np` - ما يشتغل الآن',
 ].join('\n');
             await reply(message, helpTxt);
-        }
-
-        if (message.content === '!status') {
-            const status = isPlaying
-                ? `🎥 **يشتغل:** ${currentChannelName || 'قناة'}`
-                : '🛑 **متوقف**';
-            const quality = `📐 **الجودة:** ${selectedQuality.width}x${selectedQuality.height} @ ${selectedQuality.fps}fps (${selectedQuality.bitrate})`;
-            await reply(message, `${status}\n${quality}`);
         }
     } catch (err) {
         if (err.name === 'AbortError') {
@@ -1600,8 +2152,9 @@ client.on('messageCreate', async (message) => {
             await reply(message, `❌ خطأ: ${err.message || 'حدث خطأ غير متوقع'}`);
         } catch (_) {}
         killFFmpeg();
-        try { streamer.stopStream(); } catch (_) {}
-        try { streamer.leaveVoice(); } catch (_) {}
+    try { streamer.stopStream(); } catch (_) {}
+    try { stopPlaceholder(); } catch (_) {}
+    try { streamer.leaveVoice(); } catch (_) {}
     }
 });
 
