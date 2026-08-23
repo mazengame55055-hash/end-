@@ -640,7 +640,7 @@ async function vlFetchArabicSub(subUrl) {
         let buf = Buffer.from(await r.arrayBuffer());
         if (buf.length < 10 || !buf.toString('utf8').includes('-->')) return null;
         const cleaned = buf.toString('utf8')
-            .replace(/[\u202A-\u202E\u2066-\u2069\u200E\u200F\uFEFF\u061C]/g, '')
+            .replace(/\uFEFF/g, '')
             .replace(/\r\n/g, '\n')
             .replace(/\n{3,}/g, '\n\n')
             .trim() + '\n';
@@ -664,19 +664,30 @@ function makeCrossRefresh(type, id, s, e, state) {
                 if (r2 && r2.sources.length) {
                     const pick = r2.sources[state.idx % r2.sources.length];
                     state.idx++;
+                    state.cycleFails = 0;
                     console.log(`[VL] refresh -> ${pick.quality}`);
                     return [pick];
                 }
             } catch (_) {}
-            console.log('[VL] refresh exhausted -> switching to VK');
+            console.log('[ROTATE] VL failed -> switching to VK');
             state.provider = 'VK';
         }
-        const r3 = await vkSources(type, id, s, e);
-        if (!r3 || !r3.sources.length) return null;
-        const pick = r3.sources[state.idx % r3.sources.length];
-        state.idx++;
-        console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
-        return [pick.url];
+        try {
+            const r3 = await vkSources(type, id, s, e);
+            if (r3 && r3.sources.length) {
+                const pick = r3.sources[state.idx % r3.sources.length];
+                state.idx++;
+                state.cycleFails = 0;
+                console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
+                return [pick.url];
+            }
+        } catch (_) {}
+        state.cycleFails = (state.cycleFails || 0) + 1;
+        if (state.provider === 'VK' && state.cycleFails < 6) {
+            console.log('[ROTATE] VK failed -> back to VL for fresh urls');
+            state.provider = 'VL';
+        }
+        return null;
     };
 }
 
