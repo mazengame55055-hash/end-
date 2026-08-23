@@ -516,11 +516,13 @@ function vkPickBest(sources) {
 // ===== VidLink stream extraction =====
 const VL_BASE = 'https://vidlink.pro';
 let vlReadyPromise = null;
+let vlSodium = null;
 function vlInit() {
     if (!vlReadyPromise) {
         vlReadyPromise = (async () => {
             const sodium = require('libsodium-wrappers-sumo');
             await sodium.ready;
+            vlSodium = sodium;
             globalThis.sodium = sodium;
             require('./vl_go.js');
             const wasmBytes = fs.readFileSync(path.join(__dirname, 'fu.wasm'));
@@ -536,8 +538,9 @@ function vlInit() {
 
 async function vlSources(type, tmdbId, season, episode) {
     await vlInit();
+    globalThis.sodium = vlSodium;
     const adv = globalThis.getAdv(String(tmdbId));
-    if (!adv) return null;
+    if (!adv) { console.log(`[VL] getAdv returned null for ${tmdbId}`); return null; }
     const apiUrl = type === 'movie'
         ? `${VL_BASE}/api/b/movie/${adv}?multiLang=0`
         : `${VL_BASE}/api/b/tv/${adv}/${season || 1}/${episode || 1}?multiLang=0`;
@@ -545,12 +548,12 @@ async function vlSources(type, tmdbId, season, episode) {
         headers: { 'X-Playback-Environment': 'default', Referer: `${VL_BASE}/` },
         signal: AbortSignal.timeout(20000),
     });
-    if (!r.ok) return null;
+    if (!r.ok) { console.log(`[VL] api http ${r.status} for ${type} ${tmdbId}`); return null; }
     const txt = await r.text();
-    if (!txt || txt === 'null') return null;
+    if (!txt || txt === 'null') { console.log(`[VL] api empty for ${type} ${tmdbId}`); return null; }
     const j = JSON.parse(txt);
     const st = j && j.stream;
-    if (!st) return null;
+    if (!st) { console.log(`[VL] no stream obj for ${type} ${tmdbId}: ${txt.slice(0, 80)}`); return null; }
 
     let title = '', year = '';
     try {
@@ -580,7 +583,31 @@ async function vlSources(type, tmdbId, season, episode) {
         }
     }
     if (!out.length) return null;
-    return { title, year, sources: out };
+
+    let subUrl = null;
+    const caps = Array.isArray(st.captions) ? st.captions : [];
+    const stripTashkeel = (t) => String(t || '').replace(/[\u064B-\u0652\u0670\u0640]/g, '');
+    const arCap = caps.find((x) => x && x.url && /عرب|arab/i.test(stripTashkeel(x.language))) || caps.find((x) => x && /^ar\b/i.test(stripTashkeel(x.language)));
+    if (arCap && arCap.type === 'srt') subUrl = arCap.url;
+
+    return { title, year, sources: out, subUrl };
+}
+
+async function vlFetchArabicSub(subUrl) {
+    try {
+        const r = await fetch(subUrl, { signal: AbortSignal.timeout(20000) });
+        if (!r.ok) return null;
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length < 10 || !buf.toString('utf8').includes('-->')) return null;
+        const p = `/tmp/vlsub_${process.pid}_${Date.now()}.srt`;
+        fs.writeFileSync(p, buf);
+        console.log(`[VL] arabic subs saved: ${p} (${buf.length} bytes)`);
+        return p;
+    } catch (_) { return null; }
+}
+
+function vlCleanupSub(p) {
+    if (p) { try { fs.unlinkSync(p); } catch (_) {} }
 }
 
 
@@ -616,7 +643,7 @@ async function getYtDlpStreamUrl(url, qualityHeight) {
     }
 }
 
-async function startYtStream(urls, quality, message, title, refresher) {
+async function startYtStream(urls, quality, message, title, refresher, subsPath) {
     const urlList = Array.isArray(urls) ? urls.filter(Boolean) : [urls];
     const asSrc = (x) => (typeof x === 'string' ? { url: x } : (x && x.url ? x : {}));
     let curSrc = asSrc(urlList[0]);
@@ -670,6 +697,7 @@ async function startYtStream(urls, quality, message, title, refresher) {
                 const args = [
                     '-hide_banner', '-loglevel', 'warning',
                     ...inputArgs,
+                    ...(subsPath ? ['-vf', `subtitles=${subsPath}:force_style='FontName=Noto Naskh Arabic,FontSize=22,Outline=1,Shadow=0.5,MarginV=22'`] : []),
                     '-fflags', '+genpts+discardcorrupt+nobuffer',
                     '-flags', '+low_delay+global_header',
                     '-max_muxing_queue_size', '4096',
@@ -1017,17 +1045,21 @@ client.on('messageCreate', async (message) => {
                 try {
                     res = await vlSources('movie', id);
                     best = res && vkPickBest(res.sources);
-                } catch (_) { res = null; }
+                } catch (e) { console.error('[VL] movie sources error:', e.message); res = null; }
                 if (!best) {
                     provider = 'VK';
                     res = await vkSources('movie', id, 1, 1);
                     best = vkPickBest(res.sources);
                 }
                 if (!best) return reply(message, '❌ مفيش مصادر متاحة للفيلم ده حالياً. جرّب بعدين.');
+                let subPath = null;
+                if (provider === 'VL' && res.subUrl) {
+                    subPath = await vlFetchArabicSub(res.subUrl);
+                }
                 isPlaying = true;
                 currentChannelName = res.title;
-                await reply(message, `🎬 جاري بث **${res.title}** في الروم...`);
-                console.log(`[${provider}] movie ${id} via ${best.server} ${best.quality}`);
+                await reply(message, `🎬 جاري بث **${res.title}** في الروم...${subPath ? ' 📝 بالترجمة العربية' : ''}`);
+                console.log(`[${provider}] movie ${id} via ${best.server} ${best.quality}${subPath ? ' +subs' : ''}`);
                 let srcIdx = 1;
                 const refresh = async () => {
                     if (provider === 'VL') {
@@ -1045,7 +1077,8 @@ client.on('messageCreate', async (message) => {
                     console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
                     return [pick.url];
                 };
-                const st = await startYtStream([best], selectedQuality, message, res.title, refresh);
+                const st = await startYtStream([best], selectedQuality, message, res.title, refresh, subPath);
+                vlCleanupSub(subPath);
                 isPlaying = false;
                 await reply(message, st === 'failed' ? `⚠️ اتوقف بث **${res.title}** بسبب ضغط على سيرفر الفيديو — جرّب تاني بعد دقيقة.` : `⏹️ انتهى بث **${res.title}**`);
             } catch (e) {
@@ -1067,17 +1100,21 @@ client.on('messageCreate', async (message) => {
                 try {
                     res = await vlSources('tv', parts[0], s, e);
                     best = res && vkPickBest(res.sources);
-                } catch (_) { res = null; }
+                } catch (e) { console.error('[VL] tv sources error:', e.message); res = null; }
                 if (!best) {
                     provider = 'VK';
                     res = await vkSources('tv', parts[0], s, e);
                     best = vkPickBest(res.sources);
                 }
                 if (!best) return reply(message, '❌ مفيش مصادر متاحة للحلقة دي حالياً. جرّب بعدين.');
+                let subPathTv = null;
+                if (provider === 'VL' && res.subUrl) {
+                    subPathTv = await vlFetchArabicSub(res.subUrl);
+                }
                 isPlaying = true;
                 currentChannelName = res.title;
-                await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...`);
-                console.log(`[${provider}] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}`);
+                await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...${subPathTv ? ' 📝 بالترجمة العربية' : ''}`);
+                console.log(`[${provider}] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}${subPathTv ? ' +subs' : ''}`);
                 let srcIdxTv = 1;
                 const refreshTv = async () => {
                     if (provider === 'VL') {
@@ -1095,7 +1132,8 @@ client.on('messageCreate', async (message) => {
                     console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
                     return [pick.url];
                 };
-                const st2 = await startYtStream([best], selectedQuality, message, res.title, refreshTv);
+                const st2 = await startYtStream([best], selectedQuality, message, res.title, refreshTv, subPathTv);
+                vlCleanupSub(subPathTv);
                 isPlaying = false;
                 await reply(message, st2 === 'failed' ? `⚠️ اتوقف بث **${res.title}** بسبب ضغط على سيرفر الفيديو — جرّب تاني بعد دقيقة.` : `⏹️ انتهى بث **${res.title}** S${s}E${e}`);
             } catch (e2) {
