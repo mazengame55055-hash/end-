@@ -195,6 +195,7 @@ function sleep(ms) {
 
 async function joinVoiceSafe() {
     if (streamer.voiceConnection) return;
+    const delays = [3000, 6000, 10000];
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
             await Promise.race([
@@ -202,12 +203,13 @@ async function joinVoiceSafe() {
                 sleep(15000).then(() => { throw new Error('join timeout'); }),
             ]);
             console.log('[Voice] Joined voice channel');
+            await sleep(700);
             return;
         } catch (e) {
             console.error(`[Voice] join failed (try ${attempt}/3): ${e.message}`);
             try { streamer.leaveVoice(); } catch (_) {}
             try { streamer.stopStream(); } catch (_) {}
-            await sleep(2500);
+            if (attempt < 3) await sleep(delays[attempt - 1]);
         }
     }
     throw new Error('تعذر الدخول لروم الصوت بعد عدة محاولات. جرّب !stop ثم أعد المحاولة.');
@@ -269,7 +271,10 @@ async function startStream(channel, message) {
             if (!streamer.voiceConnection) {
                 await streamer.joinVoice(GUILD_ID, VOICE_ID);
                 console.log('[Stream] Joined voice channel');
+                await sleep(700);
             }
+            try { streamer.stopStream(); } catch (_) {}
+            await sleep(300);
         } catch (e) {
             console.error('[Stream] Failed to join voice:', e.message);
             await reply(message, `❌ فشل دخول الروم الصوتي: ${e.message}`);
@@ -519,10 +524,10 @@ async function getYtDlpStreamUrl(url, qualityHeight) {
     }
 }
 
-async function startYtStream(urls, quality, message, title) {
+async function startYtStream(urls, quality, message, title, refresher) {
     const urlList = Array.isArray(urls) ? urls.filter(Boolean) : [urls];
-    const videoUrl = urlList[0];
-    const audioUrl = urlList[1] || null;
+    let videoUrl = urlList[0];
+    let audioUrl = urlList[1] || null;
     reconnectAttempts = 0;
     seekOffset = 0;
     pendingSeek = null;
@@ -537,6 +542,8 @@ async function startYtStream(urls, quality, message, title) {
 
             try {
                 await joinVoiceSafe();
+                try { streamer.stopStream(); } catch (_) {}
+                await sleep(300);
             } catch (e) {
                 isPlaying = false;
                 return reply(message, `❌ فشل دخول الروم: ${e.message}`);
@@ -621,7 +628,7 @@ async function startYtStream(urls, quality, message, title) {
                 }).then(() => resolve()).catch(reject);
             });
         } catch (err) {
-            console.error(`[YT] Error: ${err.message}`);
+            console.error(`[YT] Error: ${String((err && err.message) || err)}`);
         }
 
         killFFmpeg();
@@ -635,6 +642,21 @@ async function startYtStream(urls, quality, message, title) {
             try { streamer.stopStream(); } catch (_) {}
             await sleep(400);
             continue;
+        }
+
+        if (refresher && reconnectAttempts > 0) {
+            try {
+                const nu = await refresher();
+                if (nu && nu[0]) {
+                    urlList[0] = nu[0];
+                    videoUrl = urlList[0];
+                    audioUrl = nu[1] || null;
+                    console.log('[YT] Refreshed source URL');
+                    seekOffset = 0;
+                }
+            } catch (e) {
+                console.error('[YT] refresh failed:', e.message);
+            }
         }
 
         reconnectAttempts++;
@@ -869,7 +891,12 @@ client.on('messageCreate', async (message) => {
                 currentChannelName = res.title;
                 await reply(message, `🎬 جاري بث **${res.title}** في الروم...`);
                 console.log(`[VK] movie ${id} via ${best.server} ${best.quality}`);
-                await startYtStream([best.url], selectedQuality, message, res.title);
+                const refresh = async () => {
+                    const r2 = await vkSources('movie', id, 1, 1);
+                    const b2 = vkPickBest(r2.sources);
+                    return b2 ? [b2.url] : null;
+                };
+                await startYtStream([best.url], selectedQuality, message, res.title, refresh);
                 isPlaying = false;
                 await reply(message, `⏹️ انتهى بث **${res.title}**`);
             } catch (e) {
@@ -894,7 +921,12 @@ client.on('messageCreate', async (message) => {
                 currentChannelName = res.title;
                 await reply(message, `📺 جاري بث **${res.title}** — موسم ${s} • حلقة ${e} في الروم...`);
                 console.log(`[VK] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}`);
-                await startYtStream([best.url], selectedQuality, message, res.title);
+                const refreshTv = async () => {
+                    const r2 = await vkSources('tv', parts[0], s, e);
+                    const b2 = vkPickBest(r2.sources);
+                    return b2 ? [b2.url] : null;
+                };
+                await startYtStream([best.url], selectedQuality, message, res.title, refreshTv);
                 isPlaying = false;
                 await reply(message, `⏹️ انتهى بث **${res.title}** S${s}E${e}`);
             } catch (e2) {
