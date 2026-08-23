@@ -48,6 +48,8 @@ async function reply(msg, text) {
 }
 
 const TOKEN = process.env.TOKEN;
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
+const VIDKING_COLOR = process.env.VIDKING_COLOR || 'e50914';
 let GUILD_ID = '1324034047613079574';
 let VOICE_ID = '1538500580568203365';
 const MAIN_OWNER = '820408813790167041';
@@ -342,6 +344,31 @@ async function startStream(channel, message) {
 const YTDLP_PATH = '/home/master/.local/bin/yt-dlp';
 const COOKIES_PATH = '/home/master/end-/cookies.txt';
 
+const TMDB_IMG = 'https://image.tmdb.org/t/p/w500';
+
+async function tmdbSearch(type, query) {
+    const u = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(query)}&language=ar&include_adult=false`;
+    const r = await fetch(u, { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error(`tmdb http ${r.status}`);
+    const j = await r.json();
+    return j.results || [];
+}
+
+function vkMovieUrl(id) {
+    return `https://www.vidking.net/embed/movie/${id}?color=${VIDKING_COLOR}&autoPlay=true`;
+}
+
+function vkTvUrl(id, s, e) {
+    return `https://www.vidking.net/embed/tv/${id}/${s}/${e}?color=${VIDKING_COLOR}&autoPlay=true&nextEpisode=true&episodeSelector=true`;
+}
+
+function fmtTmdbLine(x) {
+    const t = x.title || x.name || '?';
+    const y = (x.release_date || x.first_air_date || '').slice(0, 4);
+    const r = x.vote_average ? `⭐${x.vote_average.toFixed(1)}` : '';
+    return `**${t}** ${y ? `(${y})` : ''} ${r} \`${x.id}\``;
+}
+
 async function getYtDlpInfo(url) {
     const cookiesArg = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
     try {
@@ -621,6 +648,68 @@ client.on('messageCreate', async (message) => {
             } catch (e) {
                 console.error('[YT] search error:', e.message);
                 await reply(message, '❌ فشل البحث.');
+            }
+        }
+
+        if (message.content.startsWith('!movie ') || message.content.startsWith('!فيلم ')) {
+            const q = message.content.split(' ').slice(1).join(' ').trim();
+            if (!q) return reply(message, '❌ اكتب اسم الفيلم أو رقمه.\n`!movie فاست اكس` أو `!movie 385687`');
+            if (!TMDB_API_KEY) return reply(message, '❌ مفتاح TMDB غير مضبوط.');
+
+            await reply(message, '🔍 جاري البحث...');
+
+            try {
+                if (/^\d+$/.test(q)) {
+                    const r = await fetch(`https://api.themoviedb.org/3/movie/${q}?api_key=${TMDB_API_KEY}&language=ar`, { signal: AbortSignal.timeout(15000) });
+                    if (!r.ok) return reply(message, '❌ مفيش فيلم بالـ ID ده.');
+                    const m = await r.json();
+                    const year = (m.release_date || '').slice(0, 4);
+                    let msg = `🎬 **${m.title}** ${year ? `(${year})` : ''}\n⭐ ${Number(m.vote_average).toFixed(1)}/10`;
+                    if (m.overview) msg += `\n\n📝 ${m.overview.slice(0, 300)}`;
+                    msg += `\n\n▶️ **شاهد الآن:**\n${vkMovieUrl(m.id)}`;
+                    if (m.poster_path) msg += `\n\n${TMDB_IMG}${m.poster_path}`;
+                    return reply(message, msg);
+                }
+                const results = await tmdbSearch('movie', q);
+                if (!results || results.length === 0) return reply(message, '❌ مفيش نتائج. جرّب اسم تاني.');
+                const list = results.slice(0, 5).map((x) => `${fmtTmdbLine(x)}\n↳ تشغيل: \`!movie ${x.id}\``).join('\n');
+                await reply(message, `🎬 **نتائج البحث:**\n\n${list}`);
+            } catch (e) {
+                console.error('[TMDB] movie error:', e.message);
+                return reply(message, '❌ حصل خطأ في البحث.');
+            }
+        }
+
+        if (message.content.startsWith('!tv ') || message.content.startsWith('!مسلسل ')) {
+            const parts = message.content.split(' ').slice(1);
+            if (!parts[0]) return reply(message, '❌ الاستخدام:\n`!tv بريكنج باد` للبحث\n`!tv 1396` للموسم 1 حلقة 1\n`!tv 1396 2 5` لموسم وحلقة محددة');
+            if (!TMDB_API_KEY) return reply(message, '❌ مفتاح TMDB غير مضبوط.');
+
+            await reply(message, '🔍 جاري البحث...');
+
+            try {
+                if (/^\d+$/.test(parts[0])) {
+                    const id = parts[0];
+                    const s = parseInt(parts[1], 10) || 1;
+                    const e = parseInt(parts[2], 10) || 1;
+                    const r = await fetch(`https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_API_KEY}&language=ar`, { signal: AbortSignal.timeout(15000) });
+                    if (!r.ok) return reply(message, '❌ مفيش مسلسل بالـ ID ده.');
+                    const m = await r.json();
+                    const year = (m.first_air_date || '').slice(0, 4);
+                    let msg = `📺 **${m.name}** ${year ? `(${year})` : ''}\n⭐ ${Number(m.vote_average).toFixed(1)}/10 | المواسم: ${m.number_of_seasons} | الحلقات: ${m.number_of_episodes}`;
+                    if (m.overview) msg += `\n\n📝 ${m.overview.slice(0, 300)}`;
+                    msg += `\n\n▶️ **شاهد الآن — موسم ${s} • حلقة ${e}:**\n${vkTvUrl(id, s, e)}\n\n💡 تقدر تغيّر الحلقة من قائمة الحلقات جوه المشغل.`;
+                    if (m.poster_path) msg += `\n\n${TMDB_IMG}${m.poster_path}`;
+                    return reply(message, msg);
+                }
+                const query = parts.join(' ');
+                const results = await tmdbSearch('tv', query);
+                if (!results || results.length === 0) return reply(message, '❌ مفيش نتائج. جرّب اسم تاني.');
+                const list = results.slice(0, 5).map((x) => `${fmtTmdbLine(x)}\n↳ تشغيل: \`!tv ${x.id}\``).join('\n');
+                await reply(message, `📺 **نتائج البحث:**\n\n${list}`);
+            } catch (err) {
+                console.error('[TMDB] tv error:', err.message);
+                return reply(message, '❌ حصل خطأ في البحث.');
             }
         }
 
