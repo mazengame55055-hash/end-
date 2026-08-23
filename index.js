@@ -90,6 +90,11 @@ let abortController = null;
 let channelsCache = null;
 let isPlaying = false;
 let ffmpegProcess = null;
+let mediaBufferStream = null;
+let isPaused = false;
+let mediaInfo = null;
+let pendingSeek = null;
+let seekOffset = 0;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
 const RECONNECT_DELAY = 3000;
@@ -160,6 +165,10 @@ function killFFmpeg() {
         try { ffmpegProcess.kill('SIGKILL'); } catch (_) {}
         ffmpegProcess = null;
     }
+    if (mediaBufferStream) {
+        try { mediaBufferStream.end(); } catch (_) {}
+        mediaBufferStream = null;
+    }
 }
 
 async function stopPlaying(message) {
@@ -174,6 +183,9 @@ async function stopPlaying(message) {
     }
     currentChannelName = null;
     isPlaying = false;
+    isPaused = false;
+    mediaInfo = null;
+    pendingSeek = null;
     if (message) await reply(message, `🛑 تم إيقاف **${name}** ومغادرة الروم.`);
 }
 
@@ -245,6 +257,8 @@ function buildFFmpegArgs(channelUrl, quality) {
 
 async function startStream(channel, message) {
     reconnectAttempts = 0;
+    isPaused = false;
+    mediaInfo = { title: channel.name, live: true, offsetBase: 0, runStartedAt: Date.now(), paused: false, pauseStartedAt: null };
 
     while (reconnectAttempts < MAX_RECONNECT) {
         if (!isPlaying) break;
@@ -307,6 +321,8 @@ async function startStream(channel, message) {
                 const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 16 });
                 bufferStream.on('error', () => {});
                 ffmpegProcess.stdout.pipe(bufferStream);
+                mediaBufferStream = bufferStream;
+                if (mediaInfo) { mediaInfo.runStartedAt = Date.now(); }
 
                 playStream(bufferStream, streamer, {
                     type: 'go-live',
@@ -339,6 +355,9 @@ async function startStream(channel, message) {
 
     isPlaying = false;
     currentChannelName = null;
+    mediaBufferStream = null;
+    isPaused = false;
+    mediaInfo = null;
     killFFmpeg();
     try { streamer.stopStream(); } catch (_) {}
     try { streamer.leaveVoice(); } catch (_) {}
@@ -505,6 +524,10 @@ async function startYtStream(urls, quality, message, title) {
     const videoUrl = urlList[0];
     const audioUrl = urlList[1] || null;
     reconnectAttempts = 0;
+    seekOffset = 0;
+    pendingSeek = null;
+    isPaused = false;
+    mediaInfo = { title: title || currentChannelName || 'media', live: false, offsetBase: 0, runStartedAt: Date.now(), paused: false, pauseStartedAt: null };
     const { width, height, fps, bitrate, maxrate, bufsize } = quality;
 
     while (reconnectAttempts < MAX_RECONNECT) {
@@ -522,6 +545,7 @@ async function startYtStream(urls, quality, message, title) {
         try {
             await new Promise((resolve, reject) => {
                 const mkInput = (u) => [
+                    ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
                     '-reconnect', '1',
                     '-reconnect_streamed', '1',
                     '-reconnect_delay_max', '5',
@@ -585,6 +609,8 @@ async function startYtStream(urls, quality, message, title) {
                 const bufferStream = new PassThrough({ highWaterMark: 1024 * 1024 * 16 });
                 bufferStream.on('error', () => {});
                 ffmpegProcess.stdout.pipe(bufferStream);
+                mediaBufferStream = bufferStream;
+                if (mediaInfo) { mediaInfo.offsetBase = seekOffset; mediaInfo.runStartedAt = Date.now(); }
 
                 playStream(bufferStream, streamer, {
                     type: 'go-live',
@@ -601,6 +627,16 @@ async function startYtStream(urls, quality, message, title) {
         killFFmpeg();
         if (!isPlaying) break;
 
+        if (pendingSeek !== null) {
+            seekOffset = Math.max(0, Math.floor(pendingSeek));
+            pendingSeek = null;
+            reconnectAttempts = 0;
+            console.log(`[YT] Seek -> ${seekOffset}s`);
+            try { streamer.stopStream(); } catch (_) {}
+            await sleep(400);
+            continue;
+        }
+
         reconnectAttempts++;
         if (reconnectAttempts < MAX_RECONNECT) {
             await sleep(RECONNECT_DELAY);
@@ -609,6 +645,9 @@ async function startYtStream(urls, quality, message, title) {
 
     isPlaying = false;
     currentChannelName = null;
+    mediaBufferStream = null;
+    isPaused = false;
+    mediaInfo = null;
     killFFmpeg();
     try { streamer.stopStream(); } catch (_) {}
     try { streamer.leaveVoice(); } catch (_) {}
@@ -865,6 +904,100 @@ client.on('messageCreate', async (message) => {
             }
         }
 
+        // ===== Playback controls =====
+        function fmtDur(sec) {
+            sec = Math.max(0, Math.floor(sec));
+            const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+            return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+        }
+        function playbackPos() {
+            if (!mediaInfo || mediaInfo.live || !mediaInfo.runStartedAt) return null;
+            const end = mediaInfo.paused && mediaInfo.pauseStartedAt ? mediaInfo.pauseStartedAt : Date.now();
+            return mediaInfo.offsetBase + Math.max(0, (end - mediaInfo.runStartedAt) / 1000);
+        }
+        async function cmdPause() {
+            if (!isPlaying || !ffmpegProcess) return reply(message, '❌ مفيش حاجة شغالة دلوقتي.');
+            if (isPaused) return reply(message, '⏸️ متوقف مؤقتاً بالفعل. اكتب `!resume` للتكملة.');
+            try { ffmpegProcess.kill('SIGSTOP'); } catch (_) {}
+            if (mediaBufferStream) { try { mediaBufferStream.pause(); } catch (_) {} }
+            if (mediaInfo) { mediaInfo.paused = true; mediaInfo.pauseStartedAt = Date.now(); }
+            isPaused = true;
+            await reply(message, '⏸️ تم الإيقاف المؤقت — اكتب `!resume` للتكملة.');
+        }
+        async function cmdResume() {
+            if (!isPlaying) return reply(message, '❌ مفيش حاجة شغالة دلوقتي.');
+            if (!isPaused) return reply(message, '▶️ التشغيل شغال بالفعل.');
+            if (mediaBufferStream) { try { mediaBufferStream.resume(); } catch (_) {} }
+            try { if (ffmpegProcess) ffmpegProcess.kill('SIGCONT'); } catch (_) {}
+            if (mediaInfo && mediaInfo.paused && mediaInfo.pauseStartedAt) {
+                mediaInfo.runStartedAt += Date.now() - mediaInfo.pauseStartedAt;
+                mediaInfo.paused = false;
+                mediaInfo.pauseStartedAt = null;
+            }
+            isPaused = false;
+            await reply(message, '▶️ استكمال التشغيل.');
+        }
+        async function cmdSeek(delta, target) {
+            if (!isPlaying) return reply(message, '❌ مفيش حاجة شغالة دلوقتي.');
+            if (!mediaInfo || mediaInfo.live) return reply(message, '❌ التقديم والتنقل متاح لليوتيوب والأفلام والمسلسلات فقط — البث المباشر لا يدعمه.');
+            const pos = playbackPos() || 0;
+            let t;
+            let label;
+            if (target != null) {
+                t = target; label = `🎯 الانتقال إلى \`${fmtDur(t)}\``;
+            } else if (delta >= 0) {
+                t = pos + delta; label = `⏩ تقديم ${delta} ثانية → \`${fmtDur(t)}\``;
+            } else {
+                t = Math.max(0, pos + delta); label = `⏪ رجوع ${Math.abs(delta)} ثانية → \`${fmtDur(t)}\``;
+            }
+            pendingSeek = Math.floor(t);
+            if (isPaused) {
+                isPaused = false;
+                if (mediaInfo) { mediaInfo.paused = false; mediaInfo.pauseStartedAt = null; }
+            }
+            await reply(message, `${label} ...`);
+            killFFmpeg();
+        }
+
+        if (/^!(pause|وقف|وقّف)$/.test(message.content)) {
+            await cmdPause();
+        }
+
+        if (/^!(resume|كمّل|كمل|استكمال)$/.test(message.content)) {
+            await cmdResume();
+        }
+
+        if (/^!fwd(\s+\d+)?$/.test(message.content) || /^!تقدم(\s+\d+)?$/.test(message.content)) {
+            const n = parseInt(message.content.split(' ')[1], 10);
+            await cmdSeek(isNaN(n) ? 10 : Math.min(n, 600), null);
+        }
+
+        if (/^!back(\s+\d+)?$/.test(message.content) || /^!رجوع(\s+\d+)?$/.test(message.content)) {
+            const n = parseInt(message.content.split(' ')[1], 10);
+            await cmdSeek(-(isNaN(n) ? 10 : Math.min(n, 600)), null);
+        }
+
+        if (/^!(goto|seek)\s+\S+/.test(message.content)) {
+            const arg = message.content.split(' ')[1];
+            let t = null;
+            if (/^\d+$/.test(arg)) t = parseInt(arg, 10);
+            else if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(arg)) {
+                const p = arg.split(':').map(Number);
+                t = p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + p[1];
+            }
+            if (t == null) return reply(message, '❌ الصيغة: `!goto 90` ثواني أو `!goto 3:25` دقيقة:ثانية');
+            await cmdSeek(null, t);
+        }
+
+        if (/^!np$/.test(message.content) || /^!الآن$/.test(message.content)) {
+            if (!isPlaying || !currentChannelName) return reply(message, '❌ مفيش حاجة شغالة دلوقتي.');
+            const pos = playbackPos();
+            let msg = `🎬 **يشتغل الآن:** ${currentChannelName}`;
+            if (pos != null) msg += `\n⏱️ الموضع: \`${fmtDur(pos)}\``;
+            if (isPaused) msg += '\n⏸️ الحالة: **متوقف مؤقتاً**';
+            await reply(message, msg);
+        }
+
         if (message.content === '!stop') {
             await stopPlaying(message);
         }
@@ -992,6 +1125,12 @@ client.on('messageCreate', async (message) => {
                 '`!series <id> <موسم> <حلقة>` - مشاهدة حلقة',
                 '`!playmovie <id>` - بث الفيلم في الروم الصوتي',
                 '`!playseries <id> [موسم] [حلقة]` - بث الحلقة في الروم',
+                '',
+                '⏯️ **التحكم في التشغيل:**',
+                '`!pause` - إيقاف مؤقت | `!resume` - استكمال',
+                '`!fwd <ثواني>` - تقديم | `!back <ثواني>` - رجوع',
+                '`!goto <دقيقة:ثانية>` - الانتقال لموضع محدد',
+                '`!np` - ما يشتغل الآن',
 ].join('\n');
             await reply(message, helpTxt);
         }
