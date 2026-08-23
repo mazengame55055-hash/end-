@@ -656,6 +656,102 @@ function vlCleanupSub(p) {
     if (p) { try { fs.unlinkSync(p); } catch (_) {} }
 }
 
+const CC_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
+
+async function ccFetch(url, referer) {
+    const U = vlGetUndici();
+    const hdrs = { 'user-agent': CC_UA, ...(referer ? { referer } : {}) };
+    if (U && U.fetch && U.Agent) {
+        const agent = new U.Agent({ keepAliveTimeout: 10, keepAliveMaxTimeout: 100 });
+        try {
+            return await (await U.fetch(url, { headers: hdrs, dispatcher: agent, signal: AbortSignal.timeout(20000) })).text();
+        } finally { try { await agent.close(); } catch (_) {} }
+    }
+    return fetch(url, { headers: hdrs, signal: AbortSignal.timeout(20000) }).then(r => r.text());
+}
+
+function ccUnpackPacker(html) {
+    let m = html.match(/\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('(.)'\)/s);
+    if (!m) return null;
+    let p = m[1];
+    const a = +m[2], c = +m[3], k = m[4].split(m[5]);
+    const digs = '0123456789abcdefghijklmnopqrstuvwxyz';
+    const toBase = (n, b) => { let s2 = ''; while (n > 0) { s2 = digs[n % b] + s2; n = Math.floor(n / b); } return s2 || '0'; };
+    for (let i = c - 1; i >= 0; i--) {
+        if (k[i]) p = p.replace(new RegExp('\\b' + toBase(i, a) + '\\b', 'g'), () => k[i].replace(/\\/g, '\\\\'));
+    }
+    return p.replace(/\\'/g, "'");
+}
+
+async function ccSources(type, id, s, e) {
+    try {
+        if (type === 'movie') {
+            const em = await ccFetch(`https://www.2embed.cc/embed/${id}`);
+            const vid = (em.match(/streamsrcs\.2embed\.cc\/swish\?id=([A-Za-z0-9]+)/) || [])[1];
+            if (!vid) { console.log('[CC] no swish id'); return null; }
+            const ph = await ccFetch(`https://2vcdn.skin/e/${vid}`, 'https://streamsrcs.2embed.cc/');
+            const js = ccUnpackPacker(ph);
+            if (!js) { console.log('[CC] unpack fail'); return null; }
+            const urls = [...new Set((js.replace(/\\\//g, '/').match(/https?:\/\/[^\s"'<>]+/g) || []))];
+            const txt = urls.find(u => u.includes('master.txt')) || urls.find(u => u.includes('.m3u8'));
+            if (!txt) { console.log('[CC] no stream url in packer'); return null; }
+            console.log('[CC] movie ok (HLS)');
+            return {
+                title: '', year: '',
+                sources: [{ url: txt, quality: '720', server: '2Embed', extPicky: true, headers: { referer: 'https://2vcdn.skin/' } }],
+                subUrl: null,
+            };
+        }
+        const em = await ccFetch(`https://www.2embed.cc/embedtv/${id}&s=${s}&e=${e}`);
+        if (!em.includes('xps-tv')) { console.log('[CC] no xps-tv ref'); return null; }
+        const xps = await ccFetch(`https://streamsrcs.2embed.cc/xps-tv?tmdb=${id}&s=${s}&e=${e}`, 'https://www.2embed.cc/');
+        let path = null;
+        const ifrRe = /<iframe\b[^>]*>/g;
+        let im;
+        while ((im = ifrRe.exec(xps)) !== null) {
+            if (im[0].includes('id="framesrc"')) {
+                const sm = im[0].match(/src="([^"]+)"/);
+                if (sm) path = sm[1];
+                break;
+            }
+        }
+        if (!path) { console.log('[CC] no framesrc path'); return null; }
+        const vh = await ccFetch(`https://videm.xyz/embed/tv/${path}`, 'https://streamsrcs.2embed.cc/');
+        const qm = vh.match(/Q\s*=\s*(\{.*?\});/s);
+        if (!qm) { console.log('[CC] no Q token'); return null; }
+        const q = JSON.parse(qm[1]);
+        const qs2 = `type=tv&id=${encodeURIComponent(q.id)}&s=${q.s}&e=${q.e}&t=${encodeURIComponent(q.t)}`;
+        const sj = JSON.parse(await ccFetch(`https://videm.xyz/api.php?a=sources&${qs2}`, 'https://videm.xyz/'));
+        if (!sj.servers || !sj.servers.length) { console.log('[CC] no servers'); return null; }
+        for (const srv of sj.servers.slice(0, 4)) {
+            try {
+                const pj = JSON.parse(await ccFetch(`https://videm.xyz/api.php?a=play&ref=${srv.ref}`, 'https://videm.xyz/'));
+                if (pj && pj.url) {
+                    const finalUrl = /^https?:\/\//i.test(pj.url) ? pj.url : new URL(pj.url, 'https://videm.xyz/').href;
+                    const isHls = pj.type === 'hls' || /\.(m3u8|txt)(\?|$)/i.test(finalUrl);
+                    console.log(`[CC] tv ok: ${srv.name} (${pj.type})`);
+                    return {
+                        title: (sj.title || '').replace(/\s*Season\s*\d+\s*Episode\s*\d+/i, '').trim(),
+                        year: '',
+                        sources: [{
+                            url: finalUrl,
+                            quality: '720',
+                            server: '2Embed',
+                            ...(isHls ? { extPicky: true, headers: { referer: 'https://videm.xyz/' } } : {}),
+                        }],
+                        subUrl: null,
+                    };
+                }
+            } catch (_) {}
+        }
+        console.log('[CC] all servers failed');
+        return null;
+    } catch (err) {
+        console.error('[CC] sources error:', err.message);
+        return null;
+    }
+}
+
 function makeCrossRefresh(type, id, s, e, state) {
     return async () => {
         if (state.provider === 'VL') {
@@ -672,19 +768,33 @@ function makeCrossRefresh(type, id, s, e, state) {
             console.log('[ROTATE] VL failed -> switching to VK');
             state.provider = 'VK';
         }
+        if (state.provider === 'VK') {
+            try {
+                const r3 = await vkSources(type, id, s, e);
+                if (r3 && r3.sources.length) {
+                    const pick = r3.sources[state.idx % r3.sources.length];
+                    state.idx++;
+                    state.cycleFails = 0;
+                    console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
+                    return [pick.url];
+                }
+            } catch (_) {}
+            console.log('[ROTATE] VK failed -> switching to 2Embed');
+            state.provider = 'CC';
+        }
         try {
-            const r3 = await vkSources(type, id, s, e);
-            if (r3 && r3.sources.length) {
-                const pick = r3.sources[state.idx % r3.sources.length];
+            const r4 = await ccSources(type, id, s, e);
+            if (r4 && r4.sources.length) {
+                const pick = r4.sources[state.idx % r4.sources.length];
                 state.idx++;
                 state.cycleFails = 0;
-                console.log(`[VK] refresh -> ${pick.server} ${pick.quality}`);
-                return [pick.url];
+                console.log(`[CC] refresh -> ${pick.server}`);
+                return [pick];
             }
         } catch (_) {}
         state.cycleFails = (state.cycleFails || 0) + 1;
-        if (state.provider === 'VK' && state.cycleFails < 6) {
-            console.log('[ROTATE] VK failed -> back to VL for fresh urls');
+        if (state.provider === 'CC' && state.cycleFails < 6) {
+            console.log('[ROTATE] 2Embed failed -> back to VL for fresh urls');
             state.provider = 'VL';
         }
         return null;
@@ -758,7 +868,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
 
         try {
             await new Promise((resolve, reject) => {
-                const mkInput = (u, hdrs) => [
+                const mkInput = (u, hdrs, extPicky) => [
+                    ...(extPicky ? ['-extension_picky', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'] : []),
                     ...(hdrs && hdrs.referer ? ['-headers', Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n'] : []),
                     ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
                     ...(/^https?:\/\//i.test(u) ? ['-re', '-readrate', '1.05'] : []),
@@ -773,8 +884,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     '-i', u,
                 ];
                 const inputArgs = audioUrl
-                    ? [...mkInput(videoUrl, curSrc.headers), ...mkInput(audioUrl)]
-                    : mkInput(videoUrl, curSrc.headers);
+                    ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky), ...mkInput(audioUrl)]
+                    : mkInput(videoUrl, curSrc.headers, curSrc.extPicky);
                 const subSize = Math.min(30, Math.max(16, Math.round(quality.height * 0.035)));
                 const subMarginV = Math.round(quality.height * 0.055);
                 const subStyle = [
@@ -1155,9 +1266,19 @@ client.on('messageCreate', async (message) => {
                 } catch (e) { console.error('[VL] movie sources error:', e.message); res = null; }
                 if (!best) {
                     provider = 'VK';
-                    res = await vkSources('movie', id, 1, 1);
-                    best = vkPickBest(res.sources, '720');
+                    try {
+                        res = await vkSources('movie', id, 1, 1);
+                        best = vkPickBest(res.sources, '720');
+                    } catch (e) { console.error('[VK] movie sources error:', e.message); res = null; }
                 }
+                if (!best) {
+                    provider = 'CC';
+                    try {
+                        res = await ccSources('movie', id);
+                        best = res && vkPickBest(res.sources, '720');
+                    } catch (e) { console.error('[CC] movie sources error:', e.message); res = null; }
+                }
+                if (best && !res.title) res = { ...res, title: 'الفيلم' };
                 if (!best) return reply(message, '❌ مفيش مصادر متاحة للفيلم ده حالياً. جرّب بعدين.');
                 let subPath = null;
                 if (provider === 'VL' && res.subUrl) {
@@ -1195,9 +1316,19 @@ client.on('messageCreate', async (message) => {
                 } catch (e) { console.error('[VL] tv sources error:', e.message); res = null; }
                 if (!best) {
                     provider = 'VK';
-                    res = await vkSources('tv', parts[0], s, e);
-                    best = vkPickBest(res.sources, '720');
+                    try {
+                        res = await vkSources('tv', parts[0], s, e);
+                        best = vkPickBest(res.sources, '720');
+                    } catch (e) { console.error('[VK] tv sources error:', e.message); res = null; }
                 }
+                if (!best) {
+                    provider = 'CC';
+                    try {
+                        res = await ccSources('tv', parts[0], s, e);
+                        best = res && vkPickBest(res.sources, '720');
+                    } catch (e) { console.error('[CC] tv sources error:', e.message); res = null; }
+                }
+                if (best && !res.title) res = { ...res, title: 'المسلسل' };
                 if (!best) return reply(message, '❌ مفيش مصادر متاحة للحلقة دي حالياً. جرّب بعدين.');
                 let subPathTv = null;
                 if (provider === 'VL' && res.subUrl) {
