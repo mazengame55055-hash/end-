@@ -508,8 +508,9 @@ async function vkSources(type, tmdbId, season, episode) {
     return { title, year, sources: found };
 }
 
-function vkPickBest(sources) {
-    const score = (q) => /1080/.test(q.quality) ? 4 : /720/.test(q.quality) ? 3 : /auto|hls/i.test(q.quality) ? 2 : /480|360/.test(q.quality) ? 1 : 0;
+function vkPickBest(sources, prefQuality) {
+    const base = (q) => /1080/.test(q.quality) ? 4 : /720/.test(q.quality) ? 3 : /auto|hls/i.test(q.quality) ? 2 : /480|360/.test(q.quality) ? 1 : 0;
+    const score = (q) => (prefQuality && new RegExp(prefQuality).test(q.quality) ? base(q) + 10 : base(q));
     return [...sources].sort((a, b) => score(b) - score(a))[0] || null;
 }
 
@@ -613,8 +614,14 @@ async function vlFetchArabicSub(subUrl) {
     try {
         const r = await fetch(subUrl, { signal: AbortSignal.timeout(20000) });
         if (!r.ok) return null;
-        const buf = Buffer.from(await r.arrayBuffer());
+        let buf = Buffer.from(await r.arrayBuffer());
         if (buf.length < 10 || !buf.toString('utf8').includes('-->')) return null;
+        const cleaned = buf.toString('utf8')
+            .replace(/[\u202A-\u202E\u2066-\u2069\u200E\u200F\uFEFF\u061C]/g, '')
+            .replace(/\r\n/g, '\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim() + '\n';
+        buf = Buffer.from(cleaned, 'utf8');
         const p = `/tmp/vlsub_${process.pid}_${Date.now()}.srt`;
         fs.writeFileSync(p, buf);
         console.log(`[VL] arabic subs saved: ${p} (${buf.length} bytes)`);
@@ -734,10 +741,26 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 const inputArgs = audioUrl
                     ? [...mkInput(videoUrl, curSrc.headers), ...mkInput(audioUrl)]
                     : mkInput(videoUrl, curSrc.headers);
+                const subSize = Math.min(30, Math.max(16, Math.round(quality.height * 0.035)));
+                const subMarginV = Math.round(quality.height * 0.055);
+                const subStyle = [
+                    'FontName=Noto Naskh Arabic',
+                    `FontSize=${subSize}`,
+                    'Bold=0',
+                    'PrimaryColour=&H00FFFFFF',
+                    'OutlineColour=&H00000000',
+                    'BackColour=&HA0000000',
+                    'BorderStyle=1',
+                    'Outline=1.4',
+                    'Shadow=0.6',
+                    'Spacing=0.3',
+                    'Alignment=2',
+                    `MarginV=${subMarginV}`,
+                ].join(',');
                 const args = [
                     '-hide_banner', '-loglevel', 'warning',
                     ...inputArgs,
-                    ...(subsPath ? ['-vf', `subtitles=${subsPath}:force_style='FontName=Noto Naskh Arabic,FontSize=22,Outline=1,Shadow=0.5,MarginV=22'`] : []),
+                    ...(subsPath ? ['-vf', `subtitles=${subsPath}:force_style='${subStyle}'`] : []),
                     '-fflags', '+genpts+discardcorrupt+nobuffer',
                     '-flags', '+low_delay+global_header',
                     '-max_muxing_queue_size', '4096',
@@ -1092,12 +1115,12 @@ client.on('messageCreate', async (message) => {
                 let res = null, best = null, provider = 'VL';
                 try {
                     res = await vlSources('movie', id);
-                    best = res && vkPickBest(res.sources);
+                    best = res && vkPickBest(res.sources, '720');
                 } catch (e) { console.error('[VL] movie sources error:', e.message); res = null; }
                 if (!best) {
                     provider = 'VK';
                     res = await vkSources('movie', id, 1, 1);
-                    best = vkPickBest(res.sources);
+                    best = vkPickBest(res.sources, '720');
                 }
                 if (!best) return reply(message, '❌ مفيش مصادر متاحة للفيلم ده حالياً. جرّب بعدين.');
                 let subPath = null;
@@ -1132,12 +1155,12 @@ client.on('messageCreate', async (message) => {
                 let res = null, best = null, provider = 'VL';
                 try {
                     res = await vlSources('tv', parts[0], s, e);
-                    best = res && vkPickBest(res.sources);
+                    best = res && vkPickBest(res.sources, '720');
                 } catch (e) { console.error('[VL] tv sources error:', e.message); res = null; }
                 if (!best) {
                     provider = 'VK';
                     res = await vkSources('tv', parts[0], s, e);
-                    best = vkPickBest(res.sources);
+                    best = vkPickBest(res.sources, '720');
                 }
                 if (!best) return reply(message, '❌ مفيش مصادر متاحة للحلقة دي حالياً. جرّب بعدين.');
                 let subPathTv = null;
