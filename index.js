@@ -1338,21 +1338,29 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
 
         try {
             await new Promise((resolve, reject) => {
-                const mkInput = (u, hdrs, extPicky) => [
-                    ...(extPicky ? ['-extension_picky', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'] : []),
-                    ...(hdrs && Object.keys(hdrs).length ? ['-headers', Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n'] : []),
-                    ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
-                    ...(/^https?:\/\//i.test(u) ? ['-re', '-readrate', '1.05'] : []),
-                    '-reconnect', '1',
-                    '-reconnect_streamed', '1',
-                    '-reconnect_delay_max', '5',
-                    '-reconnect_on_network_error', '1',
-                    '-rw_timeout', '10000000',
-                    '-analyzeduration', '2000000',
-                    '-probesize', '10000000',
-                    '-thread_queue_size', '8192',
-                    '-i', u,
-                ];
+                const mkInput = (u, hdrs, extPicky) => {
+                    const hparts = [];
+                    const ua = (hdrs && (hdrs['user-agent'] || hdrs.userAgent || hdrs.ua)) || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+                    hparts.push('User-Agent: ' + ua);
+                    if (hdrs && hdrs.referer) hparts.push('Referer: ' + hdrs.referer);
+                    if (hdrs && hdrs.origin) hparts.push('Origin: ' + hdrs.origin);
+                    hparts.push('Accept: */*', 'Accept-Language: en-US,en;q=0.9', 'Connection: keep-alive');
+                    return [
+                        ...(extPicky ? ['-extension_picky', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'] : []),
+                        ...(/^https?:\/\//i.test(u) ? ['-headers', hparts.join('\r\n') + '\r\n'] : []),
+                        ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
+                        ...(/^https?:\/\//i.test(u) ? ['-readrate', '1.05'] : []),
+                        '-reconnect', '1',
+                        '-reconnect_streamed', '1',
+                        '-reconnect_delay_max', '5',
+                        '-reconnect_on_network_error', '1',
+                        '-rw_timeout', '10000000',
+                        '-analyzeduration', '2000000',
+                        '-probesize', '10000000',
+                        '-thread_queue_size', '16384',
+                        '-i', u,
+                    ];
+                };
                 const inputArgs = audioUrl
                     ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky), ...mkInput(audioUrl)]
                     : mkInput(videoUrl, curSrc.headers, curSrc.extPicky);
