@@ -716,7 +716,12 @@ async function vlFetchArabicSub(subUrl) {
                 const st = normTs(sides[0]);
                 const en = normTs(sides[1]);
                 const textLines = ls.slice(ti + 1)
-                    .map((l) => l.replace(/<[^>]+>/g, '').trim())
+                    .map((l) => {
+                        let t = l.replace(/<[^>]+>/g, '').replace(/\\N|\\n/g, ' ').trim();
+                        const mLead = t.match(/^([.!؟,،])\s*(.+)$/s);
+                        if (mLead && mLead[2].trim()) t = mLead[2].trim() + mLead[1];
+                        return t;
+                    })
                     .filter(Boolean);
                 if (!textLines.length || !st || !en) continue;
                 if (textLines.every((l) => spamRe.test(l))) { spamRe.lastIndex = 0; continue; }
