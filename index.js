@@ -1447,7 +1447,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 return reply(message, `❌ فشل دخول الروم: ${e.message}`);
             }
 
-        if (seekOffset === 0 && subDelayAdj === 0 && subBaseBuf && activeSubSource === 'vl_fallback' && videoUrl) {
+        const vlCutSubs = activeSubSource === 'vl_fallback' || (activeSubSource === 'vdrk' && !['VL', 'ST'].includes(activeProvider || ''));
+        if (seekOffset === 0 && subDelayAdj === 0 && subBaseBuf && vlCutSubs && videoUrl) {
             try {
                 const mFirst = subBaseBuf.toString('utf8').match(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->/);
                 const fc = mFirst ? (+mFirst[1]) * 3600 + (+mFirst[2]) * 60 + (+mFirst[3]) + (+((mFirst[4] || '0').padEnd(3, '0'))) / 1000 : 0;
@@ -1487,6 +1488,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                         '-rw_timeout', '10000000',
                         '-analyzeduration', '2000000',
                         '-probesize', '10000000',
+                        '-fflags', '+discardcorrupt+igndts',
+                        '-err_detect', 'ignore_err',
                         '-thread_queue_size', '16384',
                         '-i', u,
                     ];
