@@ -131,6 +131,7 @@ let mediaBufferStream = null;
 let isPaused = false;
 let mediaInfo = null;
 let pendingSeek = null;
+let subDelayAdj = 0;
 let seekOffset = 0;
 let activePlayPromise = null;
 let seekFails = 0;
@@ -1302,6 +1303,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
     wdKillStreak = 0;
     wdLastPos = 0;
     pendingSeek = null;
+    subDelayAdj = 0;
     seekFails = 0;
     isPaused = false;
     mediaInfo = { title: title || currentChannelName || 'media', live: false, offsetBase: 0, runStartedAt: Date.now(), paused: false, pauseStartedAt: null };
@@ -1311,8 +1313,9 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
     if (subsPath) { try { subBaseBuf = fs.readFileSync(subsPath); } catch (_) {} }
     let rescueCount = 0;
     const RESCUE_MAX = 4;
-    const shiftSrt = (off) => {
-        if (!subBaseBuf || !(off > 0)) return subsPath;
+    const shiftSrt = (offRaw) => {
+        const off = offRaw - subDelayAdj;
+        if (!subBaseBuf || off === 0) return subsPath;
         const fmt = (t) => {
             let ms = Math.round(t * 1000);
             if (ms < 0) ms = 0;
@@ -1445,7 +1448,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     'Alignment=2',
                     'MarginV=25',
                 ].join(',');
-                const burnSubs = seekOffset > 0 ? shiftSrt(seekOffset) : subsPath;
+                const burnSubs = (seekOffset > 0 || subDelayAdj !== 0) ? shiftSrt(seekOffset) : subsPath;
                 const args = [
                     '-hide_banner', '-loglevel', 'warning',
                     ...inputArgs,
@@ -2048,6 +2051,19 @@ client.on('messageCreate', async (message) => {
         if (/^!back(\s+\d+)?$/.test(message.content) || /^!رجوع(\s+\d+)?$/.test(message.content)) {
             const n = parseInt(message.content.split(' ')[1], 10);
             await cmdSeek(-(isNaN(n) ? 10 : Math.min(n, 600)), null);
+        }
+
+        if (/^!(subdelay|تأخيرترجمة)\s+[-+]?\d+/.test(message.content)) {
+            if (!isPlaying || !mediaInfo || mediaInfo.live) return reply(message, '❌ متاح أثناء تشغيل فيلم/مسلسل فقط.');
+            const n = parseInt(message.content.split(/\s+/)[1], 10);
+            subDelayAdj = Math.max(-600, Math.min(600, n));
+            await reply(message, `📝 تأخير الترجمة = ${subDelayAdj > 0 ? '+' : ''}${subDelayAdj}ث (${subDelayAdj > 0 ? 'ستظهر أحدث' : subDelayAdj < 0 ? 'ستظهر أبكر' : 'بدون تعديل'}) — جاري إعادة الحرق...`);
+            pendingSeek = Math.floor(playbackPos() || 0);
+            killFFmpeg();
+        }
+
+        if (/^!(subdelay|تأخيرترجمة)$/.test(message.content)) {
+            await reply(message, `📝 تأخير الترجمة الحالي: ${subDelayAdj > 0 ? '+' : ''}${subDelayAdj}ث\nالصيغة: \`!subdelay 5\` لتأخيرها 5 ثواني، \`!subdelay -3\` لتقديمها 3 ثواني`);
         }
 
         if (/^!(goto|seek)\s+\S+/.test(message.content)) {
