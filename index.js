@@ -17,6 +17,22 @@ try {
         };
     }
 } catch (_) {}
+try {
+    const _und = require('undici');
+    if (_und && typeof _und.fetch === 'function' && !_und.__zstdPatched) {
+        const _uf = _und.fetch.bind(_und);
+        _und.fetch = function (u, o) {
+            o = o || {};
+            try {
+                const h = new (_und.Headers || globalThis.Headers)(o.headers || {});
+                h.set('accept-encoding', 'gzip, deflate');
+                o.headers = h;
+            } catch (_) {}
+            return _uf(u, o);
+        };
+        _und.__zstdPatched = 1;
+    }
+} catch (_) {}
 const { execSync, exec: execCb } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(execCb);
@@ -496,7 +512,19 @@ async function tmdbSearch(type, query) {
     const r = await fetch(u, { signal: AbortSignal.timeout(15000) });
     if (!r.ok) throw new Error(`tmdb http ${r.status}`);
     const j = await r.json();
-    return j.results || [];
+    const out = j.results || [];
+    const norm = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const qn = norm(query);
+    const score = (x) => {
+        const t = norm(x.title || x.name);
+        let s = (x.popularity || 0) / 100 + Math.min((x.vote_count || 0), 20000) / 400;
+        if (qn && t === qn) s += 1e9;
+        else if (qn && t.startsWith(qn)) s += 1e6;
+        else if (qn && t.includes(qn)) s += 1e4;
+        return s;
+    };
+    out.sort((a, b) => score(b) - score(a));
+    return out;
 }
 
 function vkMovieUrl(id) {
@@ -1124,8 +1152,38 @@ try { subSyncMem = JSON.parse(fs.readFileSync(SUB_MEM_FILE, 'utf8')); } catch (_
 function subMemSave() { try { fs.writeFileSync(SUB_MEM_FILE, JSON.stringify(subSyncMem)); } catch (_) {} }
 let activeTmdbId = '';
 let activeSubSource = '';
-function probeSilenceEnds(url, hdrs, seconds) {
+const FFS_BIN = '/home/master/.local/bin/ffsubsync';
+function srtFirstCueSec(p) {
+    try {
+        const m = fs.readFileSync(p, 'utf8').match(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->/);
+        return m ? (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+((m[4] || '0').padEnd(3, '0'))) / 1000 : null;
+    } catch (_) { return null; }
+}
+function ffSubSyncOffset(videoUrl, srtPath) {
     return new Promise((resolve) => {
+        try {
+            if (!fs.existsSync(FFS_BIN)) { console.log('[SUBS] ffsubsync binary missing'); return resolve(null); }
+            const out = srtPath.replace(/\.srt$/, '_ffs.srt');
+            const args = [videoUrl, '-i', srtPath, '-o', out, '--max-duration-seconds', '480'];
+            let killed = false, log = '';
+            const p = spawn(FFS_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            const to = setTimeout(() => { killed = true; try { p.kill('SIGKILL'); } catch (_) {} }, 170000);
+            p.stdout.on('data', d => { log += d.toString(); });
+            p.stderr.on('data', d => { log += d.toString(); });
+            p.on('close', (code) => {
+                clearTimeout(to);
+                if (killed) { console.log('[SUBS] ffsubsync timeout'); return resolve(null); }
+                if (code !== 0 || !fs.existsSync(out)) {
+                    console.log('[SUBS] ffsubsync failed exit=' + code + ':', log.split('\n').slice(-2).join(' ').slice(0, 200));
+                    return resolve(null);
+                }
+                console.log('[SUBS] ffsubsync OK');
+                resolve(out);
+            });
+        } catch (_) { resolve(null); }
+    });
+}
+function probeSilenceEnds(url, hdrs, seconds) {    return new Promise((resolve) => {
         try {
             const ua = (hdrs && (hdrs['user-agent'] || hdrs.userAgent)) || 'Mozilla/5.0 (Windows NT 10.0) Chrome/124';
             const ref = hdrs && hdrs.referer;
@@ -1450,20 +1508,37 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
         const vlCutSubs = activeSubSource === 'vl_fallback' || (activeSubSource === 'vdrk' && !['VL', 'ST'].includes(activeProvider || ''));
         if (seekOffset === 0 && subDelayAdj === 0 && subBaseBuf && vlCutSubs && videoUrl) {
             try {
-                const mFirst = subBaseBuf.toString('utf8').match(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->/);
-                const fc = mFirst ? (+mFirst[1]) * 3600 + (+mFirst[2]) * 60 + (+mFirst[3]) + (+((mFirst[4] || '0').padEnd(3, '0'))) / 1000 : 0;
-                console.log('[SUBS] auto-sync: probing intro silences (up to ~40s)...');
-                const ends = await probeSilenceEnds(videoUrl, curSrc.headers, 150);
-                const cands = ends.filter(t => t >= 15 && t <= 135);
-                if (cands.length) {
-                    const introEnd = Math.max(...cands);
-                    const adj = Math.round(introEnd - fc);
-                    if (adj >= 10 && adj <= 165) {
-                        subDelayAdj = adj;
-                        if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
-                        console.log(`[SUBS] AUTO-SYNC applied +${adj}s (intro end ${Math.round(introEnd)}s vs first cue ${fc.toFixed(1)}s)`);
-                    } else console.log('[SUBS] auto-sync adj out of range:', adj, '- skipping');
-                } else console.log('[SUBS] auto-sync: no silence anchors found');
+                console.log('[SUBS] auto-sync: ffsubsync audio alignment (once per title, ~1-2min)...');
+                const synced = await ffSubSyncOffset(videoUrl, subsPath);
+                let done = false;
+                if (synced) {
+                    const a = srtFirstCueSec(subsPath), b = srtFirstCueSec(synced);
+                    if (a !== null && b !== null) {
+                        const adj = Math.round(b - a);
+                        if (Math.abs(adj) >= 1 && adj >= -600 && adj <= 600) {
+                            subDelayAdj = adj;
+                            if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
+                            console.log(`[SUBS] FFSYNC applied ${adj}s (saved permanently for this title)`);
+                            done = true;
+                        } else console.log('[SUBS] ffsubsync delta negligible:', adj);
+                    }
+                }
+                if (!done) {
+                    const fc0 = srtFirstCueSec(subsPath);
+                    const fc = fc0 === null ? 0 : fc0;
+                    console.log('[SUBS] fallback: probing intro silences...');
+                    const ends = await probeSilenceEnds(videoUrl, curSrc.headers, 150);
+                    const cands = ends.filter(t => t >= 15 && t <= 135);
+                    if (cands.length) {
+                        const introEnd = Math.max(...cands);
+                        const adj = Math.round(introEnd - fc);
+                        if (adj >= 10 && adj <= 165) {
+                            subDelayAdj = adj;
+                            if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
+                            console.log(`[SUBS] AUTO-SYNC applied +${adj}s (intro end ${Math.round(introEnd)}s vs first cue ${fc.toFixed(1)}s)`);
+                        } else console.log('[SUBS] auto-sync adj out of range:', adj, '- skipping');
+                    } else console.log('[SUBS] no silence anchors found - playing unsynced, use !subdelay');
+                }
             } catch (e) { console.log('[SUBS] auto-sync error:', e.message); }
         }
 
