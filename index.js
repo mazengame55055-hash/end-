@@ -527,13 +527,18 @@ async function tmdbSearch(type, query) {
     const out = j.results || [];
     const norm = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
     const qn = norm(query);
+    const matchBonus = (t) => {
+        if (!qn || !t) return 0;
+        if (t === qn) return 5000;
+        if (t.startsWith(qn)) return 2000;
+        if (t.includes(qn)) return 500;
+        return 0;
+    };
     const score = (x) => {
-        const t = norm(x.title || x.name);
-        let s = (x.popularity || 0) / 100 + Math.min((x.vote_count || 0), 20000) / 400;
-        if (qn && t === qn) s += 1e9;
-        else if (qn && t.startsWith(qn)) s += 1e6;
-        else if (qn && t.includes(qn)) s += 1e4;
-        return s;
+        const t1 = norm(x.title || x.name);
+        const t2 = norm(x.original_title || x.original_name);
+        const tb = Math.max(matchBonus(t1), matchBonus(t2));
+        return (x.vote_count || 0) * 10 + (x.popularity || 0) + tb;
     };
     out.sort((a, b) => score(b) - score(a));
     return out;
@@ -1700,7 +1705,16 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 wdLastBytes = 0;
 
                 let stderrLog = '';
-                ffmpegProcess.stderr.on('data', (c) => { stderrLog += c.toString(); ffmpegStderrTail = (ffmpegStderrTail + c.toString()).slice(-1600); });
+                let rateLimitHits = 0;
+                ffmpegProcess.stderr.on('data', (c) => {
+                    const s = c.toString();
+                    stderrLog += s;
+                    ffmpegStderrTail = (ffmpegStderrTail + s).slice(-1600);
+                    if (s.includes('429') && ++rateLimitHits >= 3) {
+                        console.log('[FFmpeg] 429 rate-limit x3 - forcing source rotation');
+                        try { ffmpegProcess.kill('SIGKILL'); } catch (_) {}
+                    }
+                });
                 ffmpegProcess.stdout.on('error', () => {});
                 ffmpegProcess.on('error', (err) => reject(err));
                 ffmpegProcess.on('exit', (code, signal) => {
