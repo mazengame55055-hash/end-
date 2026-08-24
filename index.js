@@ -1109,6 +1109,27 @@ let subSyncMem = {};
 try { subSyncMem = JSON.parse(fs.readFileSync(SUB_MEM_FILE, 'utf8')); } catch (_) {}
 function subMemSave() { try { fs.writeFileSync(SUB_MEM_FILE, JSON.stringify(subSyncMem)); } catch (_) {} }
 let activeTmdbId = '';
+let activeSubSource = '';
+function probeSilenceEnds(url, hdrs, seconds) {
+    return new Promise((resolve) => {
+        try {
+            const ua = (hdrs && (hdrs['user-agent'] || hdrs.userAgent)) || 'Mozilla/5.0 (Windows NT 10.0) Chrome/124';
+            const ref = hdrs && hdrs.referer;
+            const hstr = 'User-Agent: ' + ua + '\r\n' + (ref ? 'Referer: ' + ref + '\r\n' : '') + 'Accept: */*\r\n';
+            const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-headers', hstr, '-t', String(seconds || 150), '-i', url, '-vn', '-af', 'silencedetect=noise=-30dB:d=1.5', '-f', 'null', '-'];
+            let err = ''; let killed = false;
+            const p = spawn('/usr/bin/ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+            const to = setTimeout(() => { killed = true; try { p.kill('SIGKILL'); } catch (_) {} }, 42000);
+            p.stderr.on('data', d => { err += d.toString(); });
+            p.on('close', () => {
+                clearTimeout(to);
+                if (killed) return resolve([]);
+                const outs = [...err.matchAll(/silence_end:\s*([\d.]+)/g)].map(m => parseFloat(m[1]));
+                resolve(outs);
+            });
+        } catch (_) { resolve([]); }
+    });
+}
 
 async function probePlayable(src) {
     try {
@@ -1411,6 +1432,25 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 isPlaying = false;
                 return reply(message, `❌ فشل دخول الروم: ${e.message}`);
             }
+
+        if (seekOffset === 0 && subDelayAdj === 0 && subBaseBuf && activeSubSource === 'vl_fallback' && videoUrl) {
+            try {
+                const mFirst = subBaseBuf.toString('utf8').match(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->/);
+                const fc = mFirst ? (+mFirst[1]) * 3600 + (+mFirst[2]) * 60 + (+mFirst[3]) + (+((mFirst[4] || '0').padEnd(3, '0'))) / 1000 : 0;
+                console.log('[SUBS] auto-sync: probing intro silences (up to ~40s)...');
+                const ends = await probeSilenceEnds(videoUrl, curSrc.headers, 150);
+                const cands = ends.filter(t => t >= 15 && t <= 135);
+                if (cands.length) {
+                    const introEnd = Math.max(...cands);
+                    const adj = Math.round(introEnd - fc);
+                    if (adj >= 10 && adj <= 165) {
+                        subDelayAdj = adj;
+                        if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
+                        console.log(`[SUBS] AUTO-SYNC applied +${adj}s (intro end ${Math.round(introEnd)}s vs first cue ${fc.toFixed(1)}s)`);
+                    } else console.log('[SUBS] auto-sync adj out of range:', adj, '- skipping');
+                } else console.log('[SUBS] auto-sync: no silence anchors found');
+            } catch (e) { console.log('[SUBS] auto-sync error:', e.message); }
+        }
 
         try {
             await new Promise((resolve, reject) => {
@@ -1884,19 +1924,22 @@ client.on('messageCreate', async (message) => {
                     provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
                 let subPath = null;
+                activeSubSource = '';
                 if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPath = await vlFetchArabicSub(res.subUrl);
+                    if (subPath) activeSubSource = 'vl';
                 }
                 if (!subPath) {
                     const alt = await vdArabicSub('movie', id);
-                    if (alt) { console.log('[SUBS] vdrk movie sub found'); subPath = await vlFetchArabicSub(alt); }
+                    if (alt) { console.log('[SUBS] vdrk movie sub found'); subPath = await vlFetchArabicSub(alt); if (subPath) activeSubSource = 'vdrk'; }
                     else console.log('[SUBS] vdrk: no movie coverage for', id);
                 }
-                if (!subPath) subPath = trArabicSrt(id);
-                if (!subPath) subPath = await osArabicSub('movie', id);
+                if (!subPath) { subPath = trArabicSrt(id); if (subPath) activeSubSource = 'tr'; }
+                if (!subPath) { subPath = await osArabicSub('movie', id); if (subPath) activeSubSource = 'os'; }
                 if (!subPath && res.subUrl) {
-                    console.log('[SUBS] last-resort: VL subs on', provider, 'video - sync may need !subdelay');
+                    console.log('[SUBS] last-resort: VL subs on', provider, 'video - auto-sync will calibrate');
                     subPath = await vlFetchArabicSub(res.subUrl);
+                    if (subPath) activeSubSource = 'vl_fallback';
                 }
                 isPlaying = true;
                 currentChannelName = res.title;
@@ -1966,19 +2009,22 @@ client.on('messageCreate', async (message) => {
                     provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
                 let subPathTv = null;
+                activeSubSource = '';
                 if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPathTv = await vlFetchArabicSub(res.subUrl);
+                    if (subPathTv) activeSubSource = 'vl';
                 }
                 if (!subPathTv) {
                     const alt = await vdArabicSub('tv', parts[0], s, e);
-                    if (alt) { console.log('[SUBS] vdrk tv sub found'); subPathTv = await vlFetchArabicSub(alt); }
+                    if (alt) { console.log('[SUBS] vdrk tv sub found'); subPathTv = await vlFetchArabicSub(alt); if (subPathTv) activeSubSource = 'vdrk'; }
                     else console.log('[SUBS] vdrk: no tv coverage for', parts[0]);
                 }
-                if (!subPathTv && provider === 'TR') subPathTv = trArabicSrt(parts[0]);
-                if (!subPathTv) subPathTv = await osArabicSub('tv', parts[0], s, e);
+                if (!subPathTv && provider === 'TR') { subPathTv = trArabicSrt(parts[0]); if (subPathTv) activeSubSource = 'tr'; }
+                if (!subPathTv) { subPathTv = await osArabicSub('tv', parts[0], s, e); if (subPathTv) activeSubSource = 'os'; }
                 if (!subPathTv && res.subUrl) {
-                    console.log('[SUBS] last-resort: VL subs on', provider, 'video - sync may need !subdelay');
+                    console.log('[SUBS] last-resort: VL subs on', provider, 'video - auto-sync will calibrate');
                     subPathTv = await vlFetchArabicSub(res.subUrl);
+                    if (subPathTv) activeSubSource = 'vl_fallback';
                 }
                 isPlaying = true;
                 lastSeriesCtx = { id: parts[0], s, e };
