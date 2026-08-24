@@ -1104,8 +1104,7 @@ async function subdlArabicSub(type, tmdbId, s, e) {
         const ar = j.subtitles.find(x => (x.language || '').toUpperCase() === 'AR' && /srt/i.test(x.format || 'srt')) || j.subtitles.find(x => (x.language || '').toUpperCase() === 'AR') || j.subtitles[0];
         if (!ar || !ar.url) return null;
         let dlUrl = ar.url.startsWith('http') ? ar.url : `https://dl.subdl.com${ar.url}`;
-        const needsUnpack = ar.url && ar.url.endsWith('.zip');
-        if (needsUnpack && SUBDL_API_KEY) dlUrl += (dlUrl.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(SUBDL_API_KEY);
+        if (!dlUrl.includes('api_key=') && SUBDL_API_KEY) dlUrl += (dlUrl.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(SUBDL_API_KEY);
         const rb = await fetch(dlUrl, { signal: AbortSignal.timeout(20000) });
         if (!rb.ok) { console.log('[SUBDL] dl http', rb.status); return null; }
         const ab = Buffer.from(await rb.arrayBuffer());
@@ -1116,21 +1115,36 @@ async function subdlArabicSub(type, tmdbId, s, e) {
             fs.writeFileSync(tmpZip, ab);
             try {
                 const { execSync } = require('child_process');
-                const list = execSync(`unzip -l "${tmpZip}" 2>/dev/null | grep -i "\\.srt" | head -1`, { encoding: 'utf8' });
-                const m = list.match(/\s(\S+\.srt)\s*$/i);
-                const pick = m ? m[1] : null;
-                if (pick) srtText = execSync(`unzip -p "${tmpZip}" "${pick}" 2>/dev/null`, { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 });
-                else {
-                    const all = execSync(`unzip -p "${tmpZip}" 2>/dev/null`, { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 });
-                    srtText = all;
+                const list = execSync(`python3 -c "import zipfile; z=zipfile.ZipFile('${tmpZip}'); print(chr(10).join(z.namelist()))"`, { encoding: 'utf8' });
+                const names = list.split('\n').map(s => s.trim()).filter(Boolean);
+                let pick = names.find(n => /\.srt$/i.test(n)) || names.find(n => /\.(ass|ssa)$/i.test(n)) || names[0] || null;
+                const isAssPick = pick && /\.(ass|ssa)$/i.test(pick);
+                if (pick) {
+                    const escPick = pick.replace(/'/g, "'\"'\"'");
+                    srtText = execSync(`python3 -c "import zipfile; z=zipfile.ZipFile('${tmpZip}'); data=z.read('${escPick}'); print(data.decode('utf-8', errors='ignore'))"`, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+                } else srtText = '';
+                if (isAssPick || (srtText.includes('[Script Info]') && srtText.includes('Dialogue:'))) {
+                    const tmpAss = `/tmp/subdl_ass_${Date.now()}.ass`;
+                    const tmpSrt2 = `/tmp/subdl_conv_${Date.now()}.srt`;
+                    fs.writeFileSync(tmpAss, srtText, 'utf8');
+                    try { execSync(`ffmpeg -y -hide_banner -loglevel error -i "${tmpAss}" "${tmpSrt2}" 2>/dev/null`, { timeout: 15000 }); srtText = fs.readFileSync(tmpSrt2, 'utf8'); } catch (_) { srtText = ''; }
+                    try { fs.unlinkSync(tmpAss); fs.unlinkSync(tmpSrt2); } catch (_) {}
                 }
             } catch (_) { srtText = ''; }
             try { fs.unlinkSync(tmpZip); } catch (_) {}
-            if (!srtText || !srtText.includes('-->')) { console.log('[SUBDL] zip no srt found'); return null; }
+            if (!srtText || !srtText.includes('-->')) { console.log('[SUBDL] zip no srt found after extract/convert'); return null; }
         } else {
             srtText = ab.toString('utf8');
             if (/\ufffd{2,}/.test(srtText.slice(0, 4000))) srtText = ab.toString('latin1');
+            if (srtText.includes('[Script Info]') && srtText.includes('Dialogue:')) {
+                const tmpAss = `/tmp/subdl_ass_${Date.now()}.ass`;
+                const tmpSrt2 = `/tmp/subdl_conv_${Date.now()}.srt`;
+                fs.writeFileSync(tmpAss, srtText, 'utf8');
+                try { const { execSync } = require('child_process'); execSync(`ffmpeg -y -hide_banner -loglevel error -i "${tmpAss}" "${tmpSrt2}" 2>/dev/null`, { timeout: 15000 }); srtText = fs.readFileSync(tmpSrt2, 'utf8'); } catch (_) { srtText = ''; }
+                try { fs.unlinkSync(tmpAss); fs.unlinkSync(tmpSrt2); } catch (_) {}
+            }
         }
+        srtText = srtText.replace(/<[^>]+>/g, '').replace(/\{[^}]*\}/g, '').replace(/\r\n/g, '\n');
         if (!srtText.includes('-->') || srtText.length < 200) return null;
         const dst = `/tmp/vlsub_subdl_${tmdbId}_${Date.now()}.srt`;
         fs.writeFileSync(dst, srtText, 'utf8');
