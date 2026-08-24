@@ -3,6 +3,20 @@ process.on('unhandledRejection', e => console.error('[CRASH]', e));
 
 const fs = require('fs');
 const path = require('path');
+try {
+    const _fetch = globalThis.fetch;
+    if (_fetch) {
+        globalThis.fetch = function (u, o) {
+            o = o || {};
+            try {
+                const h = new (globalThis.Headers || require('undici').Headers)(o.headers || {});
+                h.set('accept-encoding', 'gzip, deflate');
+                o.headers = h;
+            } catch (_) {}
+            return _fetch.call(globalThis, u, o);
+        };
+    }
+} catch (_) {}
 const { execSync, exec: execCb } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(execCb);
