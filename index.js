@@ -1875,12 +1875,12 @@ client.on('messageCreate', async (message) => {
                     provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
                 let subPath = null;
-                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
-                    subPath = await vlFetchArabicSub(res.subUrl);
-                }
-                if (!subPath) {
+                {
                     const alt = await vdArabicSub('movie', id);
                     if (alt) subPath = await vlFetchArabicSub(alt);
+                }
+                if (!subPath && (provider === 'VL' || provider === 'ST') && res.subUrl) {
+                    subPath = await vlFetchArabicSub(res.subUrl);
                 }
                 if (!subPath) subPath = trArabicSrt(id);
                 if (!subPath) subPath = await osArabicSub('movie', id);
@@ -1951,12 +1951,12 @@ client.on('messageCreate', async (message) => {
                     provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
                 let subPathTv = null;
-                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
-                    subPathTv = await vlFetchArabicSub(res.subUrl);
-                }
-                if (!subPathTv) {
+                {
                     const alt = await vdArabicSub('tv', parts[0], s, e);
                     if (alt) subPathTv = await vlFetchArabicSub(alt);
+                }
+                if (!subPathTv && (provider === 'VL' || provider === 'ST') && res.subUrl) {
+                    subPathTv = await vlFetchArabicSub(res.subUrl);
                 }
                 if (!subPathTv && provider === 'TR') subPathTv = trArabicSrt(parts[0]);
                 if (!subPathTv) subPathTv = await osArabicSub('tv', parts[0], s, e);
