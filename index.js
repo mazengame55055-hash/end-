@@ -1894,6 +1894,10 @@ client.on('messageCreate', async (message) => {
                 }
                 if (!subPath) subPath = trArabicSrt(id);
                 if (!subPath) subPath = await osArabicSub('movie', id);
+                if (!subPath && res.subUrl) {
+                    console.log('[SUBS] last-resort: VL subs on', provider, 'video - sync may need !subdelay');
+                    subPath = await vlFetchArabicSub(res.subUrl);
+                }
                 isPlaying = true;
                 currentChannelName = res.title;
                 await reply(message, `🎬 جاري بث **${res.title}** في الروم...${subPath ? ' 📝 بالترجمة العربية' : ''}`);
@@ -1972,6 +1976,10 @@ client.on('messageCreate', async (message) => {
                 }
                 if (!subPathTv && provider === 'TR') subPathTv = trArabicSrt(parts[0]);
                 if (!subPathTv) subPathTv = await osArabicSub('tv', parts[0], s, e);
+                if (!subPathTv && res.subUrl) {
+                    console.log('[SUBS] last-resort: VL subs on', provider, 'video - sync may need !subdelay');
+                    subPathTv = await vlFetchArabicSub(res.subUrl);
+                }
                 isPlaying = true;
                 lastSeriesCtx = { id: parts[0], s, e };
                 currentChannelName = res.title;
