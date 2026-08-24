@@ -881,10 +881,12 @@ function trKill() {
 async function trSources(type, tmdbId, season, episode) {
     try {
         let title = '';
+        let tyear = '';
         try {
             const mr = await fetch(`https://api.themoviedb.org/3/${type}/${tmdbId}?api_key=${TMDB_API_KEY}`, { signal: AbortSignal.timeout(15000) });
             const mj = await mr.json();
             title = mj.title || mj.name || '';
+            tyear = String((type === 'movie' ? mj.release_date : mj.first_air_date) || '').slice(0, 4);
         } catch (_) {}
         if (!title && type !== 'tv') return null;
         let mg = null;
@@ -897,6 +899,8 @@ async function trSources(type, tmdbId, season, episode) {
                     if (!t || !t.info_hash || /^0{40}$/.test(t.info_hash)) continue;
                     const seeds = parseInt(t.seeders || '0', 10);
                     if (seeds <= 5) continue;
+                    const szn = parseInt(t.size || '0', 10);
+                    if (szn && szn < 600 * 1024 * 1024) continue;
                     const nm = String(t.name || '');
                     const isCam = /\b(cam|ts|hdcam|screener)\b/i.test(nm);
                     if (isCam) continue;
@@ -905,6 +909,22 @@ async function trSources(type, tmdbId, season, episode) {
                     hits.push({ hash: t.info_hash.toLowerCase(), quality, seeds, name: nm });
                 }
             } catch (_) {}
+            if (!hits.length && tyear) {
+                try {
+                    const yr2 = await fetch(`https://apibay.org/q.php?q=${encodeURIComponent(`${title.trim()} ${tyear}`)}`, { signal: AbortSignal.timeout(15000) });
+                    const arr2 = await yr2.json();
+                    if (Array.isArray(arr2)) for (const t of arr2) {
+                        if (!t || !t.info_hash || /^0{40}$/.test(t.info_hash)) continue;
+                        const seeds = parseInt(t.seeders || '0', 10);
+                        if (seeds <= 5) continue;
+                        const nm = String(t.name || '');
+                        if (/\b(cam|ts|hdcam|screener)\b/i.test(nm)) continue;
+                        const quality = /2160p/i.test(nm) ? '2160p' : /1080p/i.test(nm) ? '1080p' : /720p/i.test(nm) ? '720p' : null;
+                        if (!quality) continue;
+                        hits.push({ hash: t.info_hash.toLowerCase(), quality, seeds, name: nm });
+                    }
+                } catch (_) {}
+            }
             hits.sort((a, b) => ((b.quality === '1080p') - (a.quality === '1080p')) || (b.seeds - a.seeds));
             mg = hits[0] || null;
         } else {
@@ -930,6 +950,29 @@ async function trSources(type, tmdbId, season, episode) {
                 cands.sort((a, b) => ((b.quality === '1080p') - (a.quality === '1080p')) || (b.seeds - a.seeds));
                 mg = cands[0] || null;
             } catch (_) {}
+            if (!mg) {
+                try {
+                    const want = `s${String(season || 1).padStart(2, '0')}e${String(episode || 1).padStart(2, '0')}`;
+                    const yr3 = await fetch(`https://apibay.org/q.php?q=${encodeURIComponent(`${title.trim()} ${want}`)}`, { signal: AbortSignal.timeout(15000) });
+                    const arr3 = await yr3.json();
+                    const cands3 = [];
+                    if (Array.isArray(arr3)) for (const t of arr3) {
+                        if (!t || !t.info_hash || /^0{40}$/.test(t.info_hash)) continue;
+                        const nm = String(t.name || '');
+                        if (!nm.toLowerCase().includes(want)) continue;
+                        if (/\b(cam|ts|hdcam)\b/i.test(nm)) continue;
+                        const seeds = parseInt(t.seeders || '0', 10) || 0;
+                        if (seeds < 3) continue;
+                        const szn = parseInt(t.size || '0', 10);
+                        if (szn && szn < 120 * 1024 * 1024) continue;
+                        const quality = /2160p/i.test(nm) ? '2160p' : /1080p/i.test(nm) ? '1080p' : /720p/i.test(nm) ? '720p' : '480';
+                        cands3.push({ hash: t.info_hash.toLowerCase(), quality, seeds, name: nm });
+                    }
+                    cands3.sort((a, b) => ((b.quality === '1080p') - (a.quality === '1080p')) || (b.seeds - a.seeds));
+                    mg = cands3[0] || null;
+                    if (mg) console.log(`[TR] TPB-TV fallback hit: ${mg.quality} (${mg.seeds} seeds)`);
+                } catch (_) {}
+            }
         }
         if (!mg) { console.log('[TR] no torrents found for', title); return null; }
         const dir = TR_DIR_PREFIX + tmdbId;
