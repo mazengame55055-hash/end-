@@ -1,5 +1,17 @@
 process.on('uncaughtException', e => console.error('[CRASH]', e));
 process.on('unhandledRejection', e => console.error('[CRASH]', e));
+try {
+    const zlib = require('zlib');
+    if (typeof zlib.createZstdDecompress !== 'function') {
+        zlib.createZstdDecompress = function () {
+            const { PassThrough } = require('stream');
+            const p = new PassThrough();
+            process.nextTick(() => p.emit('error', new Error('zstd unsupported on Node22 - server sent unexpected encoding')));
+            return p;
+        };
+        console.log('[PATCH] zlib.createZstdDecompress polyfilled');
+    }
+} catch (_) {}
 
 const fs = require('fs');
 const path = require('path');
@@ -1080,6 +1092,52 @@ function trArabicSrt(tmdbId) {
         return dst;
     } catch (_) { return null; }
 }
+const SUBDL_API_KEY = readEnvKey('SUBDL_API_KEY');
+async function subdlArabicSub(type, tmdbId, s, e) {
+    try {
+        if (!SUBDL_API_KEY) { console.log('[SUBDL] missing API key - add SUBDL_API_KEY to .env (free at subdl.com/panel/api)'); return null; }
+        const qs = new URLSearchParams({ api_key: SUBDL_API_KEY, tmdb_id: String(tmdbId), type: type === 'tv' ? 'tv' : 'movie', languages: 'AR', subs_per_page: '5' });
+        if (type === 'tv') { if (s) qs.set('season_number', String(s)); if (e) qs.set('episode_number', String(e)); }
+        const r = await fetch(`https://api.subdl.com/api/v1/subtitles?${qs}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000) });
+        const j = await r.json().catch(() => null);
+        if (!j || !j.status || !Array.isArray(j.subtitles) || !j.subtitles.length) { console.log('[SUBDL] no arabic result'); return null; }
+        const ar = j.subtitles.find(x => (x.language || '').toUpperCase() === 'AR' && /srt/i.test(x.format || 'srt')) || j.subtitles.find(x => (x.language || '').toUpperCase() === 'AR') || j.subtitles[0];
+        if (!ar || !ar.url) return null;
+        let dlUrl = ar.url.startsWith('http') ? ar.url : `https://dl.subdl.com${ar.url}`;
+        const needsUnpack = ar.url && ar.url.endsWith('.zip');
+        if (needsUnpack && SUBDL_API_KEY) dlUrl += (dlUrl.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(SUBDL_API_KEY);
+        const rb = await fetch(dlUrl, { signal: AbortSignal.timeout(20000) });
+        if (!rb.ok) { console.log('[SUBDL] dl http', rb.status); return null; }
+        const ab = Buffer.from(await rb.arrayBuffer());
+        const isZip = ab.length > 2 && ab[0] === 0x50 && ab[1] === 0x4B;
+        let srtText = '';
+        if (isZip) {
+            const tmpZip = `/tmp/subdl_${tmdbId}_${Date.now()}.zip`;
+            fs.writeFileSync(tmpZip, ab);
+            try {
+                const { execSync } = require('child_process');
+                const list = execSync(`unzip -l "${tmpZip}" 2>/dev/null | grep -i "\\.srt" | head -1`, { encoding: 'utf8' });
+                const m = list.match(/\s(\S+\.srt)\s*$/i);
+                const pick = m ? m[1] : null;
+                if (pick) srtText = execSync(`unzip -p "${tmpZip}" "${pick}" 2>/dev/null`, { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 });
+                else {
+                    const all = execSync(`unzip -p "${tmpZip}" 2>/dev/null`, { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 });
+                    srtText = all;
+                }
+            } catch (_) { srtText = ''; }
+            try { fs.unlinkSync(tmpZip); } catch (_) {}
+            if (!srtText || !srtText.includes('-->')) { console.log('[SUBDL] zip no srt found'); return null; }
+        } else {
+            srtText = ab.toString('utf8');
+            if (/\ufffd{2,}/.test(srtText.slice(0, 4000))) srtText = ab.toString('latin1');
+        }
+        if (!srtText.includes('-->') || srtText.length < 200) return null;
+        const dst = `/tmp/vlsub_subdl_${tmdbId}_${Date.now()}.srt`;
+        fs.writeFileSync(dst, srtText, 'utf8');
+        console.log(`[SUBDL] arabic saved (${Math.round(srtText.length / 1024)}KB)`);
+        return dst;
+    } catch (e) { console.log('[SUBDL] error:', e.message); return null; }
+}
 const OPENSUB_API_KEY = readEnvKey('OPENSUB_API_KEY');
 async function osArabicSub(type, tmdbId, s, e) {
     try {
@@ -2017,7 +2075,9 @@ client.on('messageCreate', async (message) => {
                 }
                 let subPath = null;
                 activeSubSource = '';
-                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
+                subPath = await subdlArabicSub('movie', id);
+                if (subPath) activeSubSource = 'subdl';
+                if (!subPath && (provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPath = await vlFetchArabicSub(res.subUrl);
                     if (subPath) activeSubSource = 'vl';
                 }
@@ -2102,7 +2162,9 @@ client.on('messageCreate', async (message) => {
                 }
                 let subPathTv = null;
                 activeSubSource = '';
-                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
+                subPathTv = await subdlArabicSub('tv', parts[0], s, e);
+                if (subPathTv) activeSubSource = 'subdl';
+                if (!subPathTv && (provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPathTv = await vlFetchArabicSub(res.subUrl);
                     if (subPathTv) activeSubSource = 'vl';
                 }
