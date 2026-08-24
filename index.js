@@ -1386,7 +1386,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
 
         try {
             await new Promise((resolve, reject) => {
-                const mkInput = (u, hdrs, extPicky) => {
+                const mkInput = (u, hdrs, extPicky, inSS) => {
                     const hparts = [];
                     const ua = (hdrs && (hdrs['user-agent'] || hdrs.userAgent || hdrs.ua)) || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
                     hparts.push('User-Agent: ' + ua);
@@ -1396,7 +1396,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     return [
                         ...(extPicky ? ['-extension_picky', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'] : []),
                         ...(/^https?:\/\//i.test(u) ? ['-headers', hparts.join('\r\n') + '\r\n'] : []),
-                        ...(seekOffset > 0 ? ['-ss', String(Math.floor(seekOffset))] : []),
+                        ...(inSS > 0 ? ['-ss', String(Math.floor(inSS))] : []),
                         ...(/^https?:\/\//i.test(u) ? ['-readrate', '1.05'] : []),
                         '-reconnect', '1',
                         '-reconnect_streamed', '1',
@@ -1409,9 +1409,12 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                         '-i', u,
                     ];
                 };
+                const PRE_SEEK = 15;
+                const inSS = seekOffset > PRE_SEEK ? seekOffset - PRE_SEEK : 0;
+                const outSS = seekOffset > 0 ? seekOffset - inSS : 0;
                 const inputArgs = audioUrl
-                    ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky), ...mkInput(audioUrl)]
-                    : mkInput(videoUrl, curSrc.headers, curSrc.extPicky);
+                    ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky, inSS), ...mkInput(audioUrl, null, false, inSS)]
+                    : mkInput(videoUrl, curSrc.headers, curSrc.extPicky, inSS);
                 const subStyle = [
                     'FontName=Noto Sans Arabic',
                     'FontSize=24',
@@ -1430,6 +1433,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 const args = [
                     '-hide_banner', '-loglevel', 'warning',
                     ...inputArgs,
+                    ...(outSS > 0 ? ['-ss', String(Math.floor(outSS))] : []),
                     ...(burnSubs
                         ? ['-vf', `scale=${width}:${height},format=yuv420p,subtitles=${burnSubs}:fontsdir=/home/master/.local/share/fonts:charenc=UTF-8:force_style='${subStyle}'`]
                         : ['-vf', `scale=${width}:${height},format=yuv420p`]),
