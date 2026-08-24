@@ -1432,15 +1432,18 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky, inSS), ...mkInput(audioUrl, null, false, inSS)]
                     : mkInput(videoUrl, curSrc.headers, curSrc.extPicky, inSS);
                 const subStyle = [
-                    'Fontname=Cairo',
-                    'FontSize=22',
+                    'FontName=Noto Sans Arabic',
+                    'FontSize=24',
+                    'Bold=1',
                     'PrimaryColour=&H00FFFFFF',
                     'OutlineColour=&H00000000',
+                    'BackColour=&HA0000000',
                     'BorderStyle=1',
-                    'Outline=2.0',
+                    'Outline=2',
                     'Shadow=1',
+                    'Spacing=0',
                     'Alignment=2',
-                    'MarginV=12',
+                    'MarginV=25',
                 ].join(',');
                 const burnSubs = seekOffset > 0 ? shiftSrt(seekOffset) : subsPath;
                 const args = [
@@ -1506,7 +1509,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                 bufferStream.on('data', (d) => { streamBytes += d.length; lastProgressAt = Date.now(); });
                 ffmpegProcess.stdout.pipe(bufferStream);
                 mediaBufferStream = bufferStream;
-                if (mediaInfo) { mediaInfo.offsetBase = seekOffset; mediaInfo.runStartedAt = Date.now(); }
+                if (mediaInfo) { mediaInfo.offsetBase = seekOffset; mediaInfo.runStartedAt = Date.now(); lastProgressAt = Date.now(); }
 
                 stopPlaceholder();
                 try { streamer.stopStream(); } catch (_) {}
@@ -1574,7 +1577,7 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
         }
 
         if (!pendingSeek && mediaInfo && !mediaInfo.live) {
-            const endT = mediaInfo.paused && mediaInfo.pauseStartedAt ? mediaInfo.pauseStartedAt : Date.now();
+            const endT = mediaInfo.paused && mediaInfo.pauseStartedAt ? mediaInfo.pauseStartedAt : Math.min(Date.now(), lastProgressAt || Date.now());
             const pos = (mediaInfo.offsetBase || 0) + Math.max(0, (endT - (mediaInfo.runStartedAt || endT)) / 1000);
             if (pos > 5) {
                 console.log(`[YT] auto-resume from ${Math.floor(pos)}s`);
@@ -1981,7 +1984,7 @@ client.on('messageCreate', async (message) => {
         }
         function playbackPos() {
             if (!mediaInfo || mediaInfo.live || !mediaInfo.runStartedAt) return null;
-            const end = mediaInfo.paused && mediaInfo.pauseStartedAt ? mediaInfo.pauseStartedAt : Date.now();
+            const end = mediaInfo.paused && mediaInfo.pauseStartedAt ? mediaInfo.pauseStartedAt : Math.min(Date.now(), lastProgressAt || Date.now());
             return mediaInfo.offsetBase + Math.max(0, (end - mediaInfo.runStartedAt) / 1000);
         }
         async function cmdPause() {
@@ -2002,6 +2005,7 @@ client.on('messageCreate', async (message) => {
                 mediaInfo.runStartedAt += Date.now() - mediaInfo.pauseStartedAt;
                 mediaInfo.paused = false;
                 mediaInfo.pauseStartedAt = null;
+                lastProgressAt = Date.now();
             }
             isPaused = false;
             await reply(message, '▶️ استكمال التشغيل.');
