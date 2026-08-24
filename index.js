@@ -139,6 +139,9 @@ let lastProgressAt = 0;
 let ffmpegStderrTail = '';
 let wdLastBytes = 0;
 let wdTrickleStreak = 0;
+let wdKillStreak = 0;
+let wdLastPos = 0;
+let activeProvider = '';
 
 const PROACTIVE_ROTATE_MS = 270000;
 setInterval(() => {
@@ -160,6 +163,15 @@ setInterval(() => {
     if (starved || (trickling && wdTrickleStreak >= 2)) {
         console.log(`[Watchdog] ${starved ? 'no data >12s' : 'trickling x' + wdTrickleStreak + ' (' + delta + 'B in 5s)'}, restarting`);
         wdTrickleStreak = 0;
+        const pos = mediaInfo && !mediaInfo.live ? (mediaInfo.offsetBase || 0) + Math.max(0, (now - (mediaInfo.runStartedAt || now)) / 1000) : 0;
+        if (pos - (wdLastPos || -999) < 60) wdKillStreak++; else wdKillStreak = 1;
+        wdLastPos = pos;
+        console.log(`[Watchdog] kill streak=${wdKillStreak} at ${Math.floor(pos)}s`);
+        if (wdKillStreak >= 2 && activeProvider) { phBump(activeProvider); console.log(`[Watchdog] provider ${activeProvider} marked unhealthy`); }
+        if (wdKillStreak >= 3) {
+            console.log('[Watchdog] escalating: forcing source rotation');
+            reconnectAttempts = MAX_RECONNECT;
+        }
         console.log('[ffmpeg] stderr tail:\n' + ffmpegStderrTail.split('\n').slice(-8).join('\n'));
         lastProgressAt = now;
         wdLastBytes = streamBytes;
@@ -168,6 +180,8 @@ setInterval(() => {
     }
     if (runAge > 30000 && delta >= 30000 && reconnectAttempts > 0) {
         reconnectAttempts = 0;
+        wdKillStreak = 0;
+        wdLastPos = 0;
         console.log('[YT] healthy playback, reconnect budget restored');
     }
 }, 5000);
@@ -1285,6 +1299,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
     let audioUrl = urlList[1] ? asSrc(urlList[1]).url : null;
     reconnectAttempts = 0;
     seekOffset = 0;
+    wdKillStreak = 0;
+    wdLastPos = 0;
     pendingSeek = null;
     seekFails = 0;
     isPaused = false;
@@ -1416,18 +1432,15 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     ? [...mkInput(videoUrl, curSrc.headers, curSrc.extPicky, inSS), ...mkInput(audioUrl, null, false, inSS)]
                     : mkInput(videoUrl, curSrc.headers, curSrc.extPicky, inSS);
                 const subStyle = [
-                    'FontName=Noto Sans Arabic',
-                    'FontSize=24',
-                    'Bold=1',
+                    'Fontname=Cairo',
+                    'FontSize=22',
                     'PrimaryColour=&H00FFFFFF',
                     'OutlineColour=&H00000000',
-                    'BackColour=&HA0000000',
                     'BorderStyle=1',
-                    'Outline=2',
+                    'Outline=2.0',
                     'Shadow=1',
-                    'Spacing=0',
                     'Alignment=2',
-                    'MarginV=25',
+                    'MarginV=12',
                 ].join(',');
                 const burnSubs = seekOffset > 0 ? shiftSrt(seekOffset) : subsPath;
                 const args = [
@@ -1871,8 +1884,9 @@ client.on('messageCreate', async (message) => {
                 console.log(`[${provider}] movie ${id} via ${best.server} ${best.quality}${subPath ? ' +subs' : ''}`);
                 const rState = { provider, idx: 1 };
                 const refresh = makeCrossRefresh('movie', id, 1, 1, rState);
-                const st = await startYtStream([best], selectedQuality, message, res.title, refresh, subPath);
-                vlCleanupSub(subPath);
+        activeProvider = provider;
+        const st = await startYtStream([best], selectedQuality, message, res.title, refresh, subPath);
+        vlCleanupSub(subPath);
                 isPlaying = false;
                 await reply(message, st === 'failed' ? `⚠️ اتوقف بث **${res.title}** بسبب ضغط على سيرفر الفيديو — جرّب تاني بعد دقيقة.` : `⏹️ انتهى بث **${res.title}**`);
             } catch (e) {
@@ -1947,7 +1961,8 @@ client.on('messageCreate', async (message) => {
                 console.log(`[${provider}] tv ${parts[0]} S${s}E${e} via ${best.server} ${best.quality}${subPathTv ? ' +subs' : ''}`);
                 const rStateTv = { provider, idx: 1 };
                 const refreshTv = makeCrossRefresh('tv', parts[0], s, e, rStateTv);
-                const st2 = await startYtStream([best], selectedQuality, message, res.title, refreshTv, subPathTv);
+                activeProvider = provider;
+        const st2 = await startYtStream([best], selectedQuality, message, res.title, refreshTv, subPathTv);
                 vlCleanupSub(subPathTv);
                 isPlaying = false;
                 await reply(message, st2 === 'failed' ? `⚠️ اتوقف بث **${res.title}** بسبب ضغط على سيرفر الفيديو — جرّب تاني بعد دقيقة.` : `⏹️ انتهى بث **${res.title}** S${s}E${e}`);
