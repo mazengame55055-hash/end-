@@ -1104,6 +1104,11 @@ function phVal(p) {
 function phBump(p) { const h = providerHealth[p] || (providerHealth[p] = { n: 0 }); h.n++; h.t = Date.now(); phSave(); }
 function phReset(p) { delete providerHealth[p]; phSave(); }
 const PH_SKIP = 4;
+const SUB_MEM_FILE = '/tmp/subsync_mem.json';
+let subSyncMem = {};
+try { subSyncMem = JSON.parse(fs.readFileSync(SUB_MEM_FILE, 'utf8')); } catch (_) {}
+function subMemSave() { try { fs.writeFileSync(SUB_MEM_FILE, JSON.stringify(subSyncMem)); } catch (_) {} }
+let activeTmdbId = '';
 
 async function probePlayable(src) {
     try {
@@ -1304,6 +1309,10 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
     wdLastPos = 0;
     pendingSeek = null;
     subDelayAdj = 0;
+    if (activeTmdbId && subSyncMem[activeTmdbId] != null) {
+        subDelayAdj = subSyncMem[activeTmdbId];
+        console.log(`[SUBS] applying saved sync ${subDelayAdj}s for tmdb ${activeTmdbId}`);
+    }
     seekFails = 0;
     isPaused = false;
     mediaInfo = { title: title || currentChannelName || 'media', live: false, offsetBase: 0, runStartedAt: Date.now(), paused: false, pauseStartedAt: null };
@@ -1875,12 +1884,13 @@ client.on('messageCreate', async (message) => {
                     provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
                 let subPath = null;
-                {
-                    const alt = await vdArabicSub('movie', id);
-                    if (alt) subPath = await vlFetchArabicSub(alt);
-                }
-                if (!subPath && (provider === 'VL' || provider === 'ST') && res.subUrl) {
+                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPath = await vlFetchArabicSub(res.subUrl);
+                }
+                if (!subPath) {
+                    const alt = await vdArabicSub('movie', id);
+                    if (alt) { console.log('[SUBS] vdrk movie sub found'); subPath = await vlFetchArabicSub(alt); }
+                    else console.log('[SUBS] vdrk: no movie coverage for', id);
                 }
                 if (!subPath) subPath = trArabicSrt(id);
                 if (!subPath) subPath = await osArabicSub('movie', id);
@@ -1891,6 +1901,7 @@ client.on('messageCreate', async (message) => {
                 const rState = { provider, idx: 1 };
                 const refresh = makeCrossRefresh('movie', id, 1, 1, rState);
         activeProvider = provider;
+        activeTmdbId = String(id);
         const st = await startYtStream([best], selectedQuality, message, res.title, refresh, subPath);
         vlCleanupSub(subPath);
                 isPlaying = false;
@@ -1951,12 +1962,13 @@ client.on('messageCreate', async (message) => {
                     provider = 'TR'; res = tr; best = vkPickBest(tr.sources, '720');
                 }
                 let subPathTv = null;
-                {
-                    const alt = await vdArabicSub('tv', parts[0], s, e);
-                    if (alt) subPathTv = await vlFetchArabicSub(alt);
-                }
-                if (!subPathTv && (provider === 'VL' || provider === 'ST') && res.subUrl) {
+                if ((provider === 'VL' || provider === 'ST') && res.subUrl) {
                     subPathTv = await vlFetchArabicSub(res.subUrl);
+                }
+                if (!subPathTv) {
+                    const alt = await vdArabicSub('tv', parts[0], s, e);
+                    if (alt) { console.log('[SUBS] vdrk tv sub found'); subPathTv = await vlFetchArabicSub(alt); }
+                    else console.log('[SUBS] vdrk: no tv coverage for', parts[0]);
                 }
                 if (!subPathTv && provider === 'TR') subPathTv = trArabicSrt(parts[0]);
                 if (!subPathTv) subPathTv = await osArabicSub('tv', parts[0], s, e);
@@ -1968,6 +1980,7 @@ client.on('messageCreate', async (message) => {
                 const rStateTv = { provider, idx: 1 };
                 const refreshTv = makeCrossRefresh('tv', parts[0], s, e, rStateTv);
                 activeProvider = provider;
+        activeTmdbId = String(parts[0]);
         const st2 = await startYtStream([best], selectedQuality, message, res.title, refreshTv, subPathTv);
                 vlCleanupSub(subPathTv);
                 isPlaying = false;
@@ -2057,7 +2070,8 @@ client.on('messageCreate', async (message) => {
             if (!isPlaying || !mediaInfo || mediaInfo.live) return reply(message, '❌ متاح أثناء تشغيل فيلم/مسلسل فقط.');
             const n = parseInt(message.content.split(/\s+/)[1], 10);
             subDelayAdj = Math.max(-600, Math.min(600, n));
-            await reply(message, `📝 تأخير الترجمة = ${subDelayAdj > 0 ? '+' : ''}${subDelayAdj}ث (${subDelayAdj > 0 ? 'ستظهر أحدث' : subDelayAdj < 0 ? 'ستظهر أبكر' : 'بدون تعديل'}) — جاري إعادة الحرق...`);
+            if (activeTmdbId) { subSyncMem[activeTmdbId] = subDelayAdj; subMemSave(); }
+            await reply(message, `📝 تأخير الترجمة = ${subDelayAdj > 0 ? '+' : ''}${subDelayAdj}ث — تم الحرق من جديد${activeTmdbId ? ' ✅ محفوظ تلقائيًا لهذا الفيلم للأبد' : ''}`);
             pendingSeek = Math.floor(playbackPos() || 0);
             killFFmpeg();
         }
