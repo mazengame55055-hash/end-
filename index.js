@@ -163,7 +163,7 @@ const QUALITY_PRESETS = {
     '8k':    { width: 7680, height: 4320, fps: 30,  bitrate: '50000k', maxrate: '60000k', bufsize: '120000k' },
 };
 
-let selectedQuality = QUALITY_PRESETS['1080p'];
+let selectedQuality = QUALITY_PRESETS['360p'];
 let currentChannelName = null;
 let abortController = null;
 let channelsCache = null;
@@ -1229,6 +1229,7 @@ try { subSyncMem = JSON.parse(fs.readFileSync(SUB_MEM_FILE, 'utf8')); } catch (_
 function subMemSave() { try { fs.writeFileSync(SUB_MEM_FILE, JSON.stringify(subSyncMem)); } catch (_) {} }
 let activeTmdbId = '';
 let activeSubSource = '';
+let rateLimitCooldownUntil = 0;
 const FFS_BIN = '/home/master/.local/bin/ffsubsync';
 function srtFirstCueSec(p) {
     try {
@@ -1265,7 +1266,7 @@ function probeSilenceEnds(url, hdrs, seconds) {    return new Promise((resolve) 
             const ua = (hdrs && (hdrs['user-agent'] || hdrs.userAgent)) || 'Mozilla/5.0 (Windows NT 10.0) Chrome/124';
             const ref = hdrs && hdrs.referer;
             const hstr = 'User-Agent: ' + ua + '\r\n' + (ref ? 'Referer: ' + ref + '\r\n' : '') + 'Accept: */*\r\n';
-            const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-headers', hstr, '-t', String(seconds || 150), '-i', url, '-vn', '-af', 'silencedetect=noise=-30dB:d=1.5', '-f', 'null', '-'];
+            const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-headers', hstr, '-t', String(seconds || 150), '-i', url, '-vn', '-af', 'silencedetect=noise=-30dB:d=3', '-f', 'null', '-'];
             let err = ''; let killed = false;
             const p = spawn('/usr/bin/ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
             const to = setTimeout(() => { killed = true; try { p.kill('SIGKILL'); } catch (_) {} }, 42000);
@@ -1519,8 +1520,12 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
             out.push(`${fmt(st - off)} --> ${fmt(en - off)}`);
         }
         const p2 = subsPath.replace(/\.srt$/i, '') + `_sh${Math.floor(off)}s.srt`;
-        try { fs.writeFileSync(p2, out.join('\n')); console.log(`[SUBS] shifted by ${Math.floor(off)}s -> ${p2}`); return p2; }
-        catch (_) { return subsPath; }
+        try {
+            fs.writeFileSync(p2, out.join('\n'));
+            if (!fs.existsSync(p2) || fs.statSync(p2).size < 50) { console.log('[SUBS] shifted file invalid, using original'); return subsPath; }
+            console.log(`[SUBS] shifted by ${Math.floor(off)}s -> ${p2}`);
+            return p2;
+        } catch (_) { return subsPath; }
     };
 
     let placeholderProc = null;
@@ -1583,39 +1588,45 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
             }
 
         const vlCutSubs = activeSubSource === 'vl_fallback' || (activeSubSource === 'vdrk' && !['VL', 'ST'].includes(activeProvider || ''));
-        if (seekOffset === 0 && subDelayAdj === 0 && subBaseBuf && vlCutSubs && videoUrl) {
+        const needAutoSync = seekOffset === 0 && subDelayAdj === 0 && subBaseBuf && videoUrl;
+        if (needAutoSync) {
             try {
-                console.log('[SUBS] auto-sync: ffsubsync audio alignment (once per title, ~1-2min)...');
-                const synced = await ffSubSyncOffset(videoUrl, subsPath);
+                const fc0 = srtFirstCueSec(subsPath);
+                const fc = fc0 === null ? 0 : fc0;
                 let done = false;
-                if (synced) {
-                    const a = srtFirstCueSec(subsPath), b = srtFirstCueSec(synced);
-                    if (a !== null && b !== null) {
-                        const adj = Math.round(b - a);
-                        if (Math.abs(adj) >= 1 && adj >= -600 && adj <= 600) {
-                            subDelayAdj = adj;
-                            if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
-                            console.log(`[SUBS] FFSYNC applied ${adj}s (saved permanently for this title)`);
-                            done = true;
-                        } else console.log('[SUBS] ffsubsync delta negligible:', adj);
-                    }
-                }
+                console.log(`[SUBS] first cue at ${fc.toFixed(1)}s, probing intro silences (primary)...`);
+                const ends = await probeSilenceEnds(videoUrl, curSrc.headers, 150);
+                console.log(`[SUBS] silence ends: [${ends.map(t=>Math.round(t)).join(', ')}]`);
+                const cands = ends.filter(t => t >= 30 && t <= 90);
+                if (cands.length) {
+                    const introEnd = Math.max(...cands);
+                    const adj = Math.round(introEnd - fc);
+                    if (adj >= 10 && adj <= 165) {
+                        subDelayAdj = adj;
+                        if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
+                        console.log(`[SUBS] AUTO-SYNC applied +${adj}s (intro end ${Math.round(introEnd)}s vs first cue ${fc.toFixed(1)}s, saved permanently)`);
+                        done = true;
+                    } else console.log('[SUBS] silence adj out of range:', adj);
+                } else console.log('[SUBS] no silence anchors in 30-90s range');
                 if (!done) {
-                    const fc0 = srtFirstCueSec(subsPath);
-                    const fc = fc0 === null ? 0 : fc0;
-                    console.log('[SUBS] fallback: probing intro silences...');
-                    const ends = await probeSilenceEnds(videoUrl, curSrc.headers, 150);
-                    const cands = ends.filter(t => t >= 15 && t <= 135);
-                    if (cands.length) {
-                        const introEnd = Math.max(...cands);
-                        const adj = Math.round(introEnd - fc);
-                        if (adj >= 10 && adj <= 165) {
-                            subDelayAdj = adj;
-                            if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
-                            console.log(`[SUBS] AUTO-SYNC applied +${adj}s (intro end ${Math.round(introEnd)}s vs first cue ${fc.toFixed(1)}s)`);
-                        } else console.log('[SUBS] auto-sync adj out of range:', adj, '- skipping');
-                    } else console.log('[SUBS] no silence anchors found - playing unsynced, use !subdelay');
+                    console.log('[SUBS] auto-sync fallback: ffsubsync audio alignment (~1-2min)...');
+                    try {
+                        const synced = await ffSubSyncOffset(videoUrl, subsPath);
+                        if (synced) {
+                            const a = srtFirstCueSec(subsPath), b = srtFirstCueSec(synced);
+                            if (a !== null && b !== null) {
+                                const adj = Math.round(b - a);
+                                if (Math.abs(adj) >= 1 && adj >= -600 && adj <= 600) {
+                                    subDelayAdj = adj;
+                                    if (activeTmdbId) { subSyncMem[activeTmdbId] = adj; subMemSave(); }
+                                    console.log(`[SUBS] FFSYNC applied ${adj}s (saved permanently for this title)`);
+                                    done = true;
+                                } else console.log('[SUBS] ffsubsync delta negligible:', adj);
+                            }
+                        }
+                    } catch (e) { console.log('[SUBS] ffsubsync error:', e.message); }
                 }
+                if (!done) console.log('[SUBS] auto-sync failed - use !subdelay N manually');
             } catch (e) { console.log('[SUBS] auto-sync error:', e.message); }
         }
 
@@ -1711,7 +1722,8 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
                     stderrLog += s;
                     ffmpegStderrTail = (ffmpegStderrTail + s).slice(-1600);
                     if (s.includes('429') && ++rateLimitHits >= 3) {
-                        console.log('[FFmpeg] 429 rate-limit x3 - forcing source rotation');
+                        console.log('[FFmpeg] 429 rate-limit x3 - cooling down 60s before rotation');
+                        rateLimitCooldownUntil = Date.now() + 60000;
                         try { ffmpegProcess.kill('SIGKILL'); } catch (_) {}
                     }
                 });
@@ -1775,6 +1787,15 @@ async function startYtStream(urls, quality, message, title, refresher, subsPath)
         }
 
         const ranMs = Date.now() - (mediaInfo ? mediaInfo.runStartedAt : Date.now());
+
+        if (rateLimitCooldownUntil > Date.now()) {
+            const waitSec = Math.ceil((rateLimitCooldownUntil - Date.now()) / 1000);
+            console.log(`[YT] 429 cooldown: waiting ${waitSec}s before retry...`);
+            startPlaceholder();
+            await sleep(rateLimitCooldownUntil - Date.now());
+            rateLimitCooldownUntil = 0;
+        }
+
         if (seekOffset > 0 && ranMs < 8000 && seekFails < 8) {
             seekFails++;
             console.log(`[YT] Seeked run died fast (${Math.round(ranMs / 1000)}s), retry ${seekFails}/8 with fresh URL`);
